@@ -1004,6 +1004,16 @@ function Invoke-DnsLookup {
     Write-Host "=== Résolution DNS (équivalent nslookup) ===" -ForegroundColor Cyan
     Write-Host "  Échap pour revenir au menu principal." -ForegroundColor DarkGray
     Write-Host ""
+
+    $dnsServer = Read-HostWithEscape -Prompt "Serveur DNS à interroger (Entrée = résolveur par défaut du système)"
+    if ($null -eq $dnsServer) { return }
+    if ([string]::IsNullOrWhiteSpace($dnsServer)) {
+        $dnsServer = $null
+    } else {
+        Write-Host "  Requêtes envoyées à : $dnsServer" -ForegroundColor DarkGray
+    }
+    Write-Host ""
+
     while ($true) {
         $target = Read-HostWithEscape -Prompt "Nom d'hôte ou domaine à résoudre"
         if ($null -eq $target) { return }
@@ -1011,11 +1021,30 @@ function Invoke-DnsLookup {
 
         Write-Host ""
         try {
-            Resolve-DnsName -Name $target -ErrorAction Stop | Format-Table -AutoSize | Out-String | Write-Host
+            if ($dnsServer) {
+                Resolve-DnsName -Name $target -Server $dnsServer -ErrorAction Stop | Format-Table -AutoSize | Out-String | Write-Host
+            } else {
+                Resolve-DnsName -Name $target -ErrorAction Stop | Format-Table -AutoSize | Out-String | Write-Host
+            }
         } catch {
             Write-Host "Erreur lors de la résolution DNS : $($_.Exception.Message)" -ForegroundColor Red
         }
         Write-Host ""
+    }
+}
+
+# Lance un executable externe en console partagee et attend sa fin, en laissant
+# Echap l'interrompre a tout moment (le processus est alors tue). Utilise par
+# ping -t (infini par nature) et tracert (long a terminer).
+function Wait-ProcessOrEscape {
+    param([string]$FilePath, [string[]]$ArgumentList)
+    $proc = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -PassThru
+    while (-not $proc.HasExited) {
+        if ([Console]::KeyAvailable -and ([Console]::ReadKey($true).Key -eq 'Escape')) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            break
+        }
+        Start-Sleep -Milliseconds 100
     }
 }
 
@@ -1033,14 +1062,7 @@ function Invoke-PingHost {
         Write-Host "Ping vers $target (Échap pour arrêter)..." -ForegroundColor Yellow
         Write-Host ""
 
-        $proc = Start-Process -FilePath ping.exe -ArgumentList @('-t', $target) -NoNewWindow -PassThru
-        while (-not $proc.HasExited) {
-            if ([Console]::KeyAvailable -and ([Console]::ReadKey($true).Key -eq 'Escape')) {
-                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                break
-            }
-            Start-Sleep -Milliseconds 100
-        }
+        Wait-ProcessOrEscape -FilePath ping.exe -ArgumentList @('-t', $target)
         Write-Host ""
     }
 }
@@ -1048,7 +1070,7 @@ function Invoke-PingHost {
 function Invoke-TracertHost {
     Clear-Host
     Write-Host "=== Tracert ===" -ForegroundColor Cyan
-    Write-Host "  Échap pour revenir au menu principal." -ForegroundColor DarkGray
+    Write-Host "  Échap pour interrompre le tracé en cours ou revenir au menu principal." -ForegroundColor DarkGray
     Write-Host ""
     while ($true) {
         $target = Read-HostWithEscape -Prompt "Hôte ou adresse IP à tracer"
@@ -1056,7 +1078,7 @@ function Invoke-TracertHost {
         if ([string]::IsNullOrWhiteSpace($target)) { continue }
 
         Write-Host ""
-        & tracert.exe $target
+        Wait-ProcessOrEscape -FilePath tracert.exe -ArgumentList @($target)
         Write-Host ""
     }
 }
@@ -1438,6 +1460,103 @@ function Invoke-ArpTable {
                 Interface = $_.InterfaceAlias
             }
         } | Sort-Object Interface, { [version]$_.IP } | Format-Table -AutoSize | Out-String | Write-Host
+    }
+
+    Wait-EnterOrEscape
+}
+
+function Invoke-DnsLeakTest {
+    Clear-Host
+    Write-Host "=== Test de fuite DNS (dnsleak) ===" -ForegroundColor Cyan
+    Write-Host "  Compare les serveurs DNS configurés localement avec les résolveurs réellement" -ForegroundColor DarkGray
+    Write-Host "  utilisés, tels que vus par les serveurs autoritaires sur Internet." -ForegroundColor DarkGray
+    Write-Host ""
+
+    Write-Host "--- Serveurs DNS configurés (interfaces actives) ---" -ForegroundColor DarkCyan
+    $ifaces = @(Get-VisibleInterfaces | Where-Object { $_.Status -eq 'Up' -and $_.DnsServers.Count -gt 0 })
+    if ($ifaces.Count -eq 0) {
+        Write-Host "  (aucun serveur configuré)" -ForegroundColor Yellow
+    } else {
+        foreach ($i in $ifaces) {
+            Write-Host ("  {0,-20} : {1}" -f $i.Name, ($i.DnsServers -join ', '))
+        }
+    }
+    Write-Host ""
+
+    # Le TXT whoami d'Akamai renvoie l'adresse du resolver qui interroge reellement
+    # leurs serveurs autoritaires ("ns"), l'IP source de cette requete DNS ("ip") et
+    # l'eventuel sous-reseau transmis via EDNS Client Subnet ("ecs").
+    Write-Host "--- Résolveur sortant (vu par Akamai) ---" -ForegroundColor DarkCyan
+    $akamaiIp = $null
+    try {
+        $txt = @(Resolve-DnsName -Name 'whoami.ds.akahelp.net' -Type TXT -ErrorAction Stop)
+        foreach ($r in $txt) {
+            if ($r.PSObject.Properties['Strings'] -and $r.Strings.Count -ge 2) {
+                switch ($r.Strings[0]) {
+                    'ns'  { Write-Host ("  Résolveur DNS sortant : {0}" -f $r.Strings[1]) }
+                    'ip'  { $akamaiIp = $r.Strings[1]; Write-Host ("  IP source de la requête DNS : {0}" -f $akamaiIp) }
+                    'ecs' { Write-Host ("  Sous-réseau transmis (ECS) : {0}" -f $r.Strings[1]) -ForegroundColor DarkGray }
+                }
+            }
+        }
+        Write-Host ""
+        Write-Host "  Le « résolveur DNS sortant » est le serveur qui a réellement transmis votre" -ForegroundColor DarkGray
+        Write-Host "  requête à Akamai. L'« IP source » est l'adresse IP de cette requête : votre" -ForegroundColor DarkGray
+        Write-Host "  propre IP publique si votre résolveur la transmet telle quelle, sinon celle" -ForegroundColor DarkGray
+        Write-Host "  du résolveur lui-même (cas des DNS publics type Cloudflare/Google/VPN)." -ForegroundColor DarkGray
+    } catch {
+        Write-Host "  Indisponible ($($_.Exception.Message))" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    Write-Host "--- Test de fuite complet (bash.ws) ---" -ForegroundColor DarkCyan
+    Write-Host "  Résolution d'une série de sous-domaines uniques, puis interrogation du service..." -ForegroundColor Yellow
+    try {
+        $id = Invoke-RestMethod -Uri 'https://bash.ws/id' -TimeoutSec 10 -ErrorAction Stop
+        1..10 | ForEach-Object {
+            Resolve-DnsName -Name "$_.$id.bash.ws" -DnsOnly -ErrorAction SilentlyContinue | Out-Null
+        }
+        Start-Sleep -Seconds 2
+        # Le pipe vers Write-Output force l'enumeration element par element avant le
+        # wrap @() : sans lui, Invoke-RestMethod renvoie tout le tableau JSON comme un
+        # bloc unique, et @() l'enveloppe une deuxieme fois (Count=1, avec un seul
+        # element qui est lui-meme tout le tableau).
+        $result = @(Invoke-RestMethod -Uri "https://bash.ws/dnsleak/test/$id`?json" -TimeoutSec 15 -ErrorAction Stop | Write-Output)
+
+        $publicIp = @($result | Where-Object { $_.type -eq 'ip' })
+        $dnsSeen = @($result | Where-Object { $_.type -eq 'dns' })
+        $conclusion = @($result | Where-Object { $_.type -eq 'conclusion' })
+
+        if ($publicIp.Count -gt 0) {
+            Write-Host ""
+            Write-Host ("  Votre IP publique (détectée en HTTP, via bash.ws) : {0} ({1}, {2})" -f $publicIp[0].ip, $publicIp[0].country_name, $publicIp[0].asn)
+            if ($akamaiIp -and $akamaiIp -ne $publicIp[0].ip) {
+                Write-Host "  (différente de l'IP source vue par Akamai plus haut : normal, ce n'est pas la" -ForegroundColor DarkGray
+                Write-Host "  même mesure — celle-ci vient d'une requête HTTP directe, pas d'une requête DNS.)" -ForegroundColor DarkGray
+            }
+        }
+        if ($dnsSeen.Count -eq 0) {
+            Write-Host "  Aucun résolveur détecté (réessayez)." -ForegroundColor Yellow
+        } else {
+            Write-Host ""
+            Write-Host ("  {0} résolveur(s) DNS sortant(s) détecté(s) (serveurs ayant réellement" -f $dnsSeen.Count)
+            Write-Host "  résolu vos requêtes de test, indépendamment de ce que vous avez configuré) :" -ForegroundColor DarkGray
+            $dnsSeen | ForEach-Object {
+                [PSCustomObject]@{ 'Résolveur' = $_.ip; Pays = $_.country_name; 'Opérateur (ASN)' = $_.asn }
+            } | Format-Table -AutoSize | Out-String | Write-Host
+        }
+        if ($conclusion.Count -gt 0 -and -not [string]::IsNullOrWhiteSpace($conclusion[0].ip)) {
+            $verdict = switch -Wildcard ($conclusion[0].ip) {
+                'DNS may be leaking*' { @{ Text = 'Fuite DNS possible : des résolveurs semblent liés à votre connexion locale.'; Color = 'Yellow' } }
+                'DNS is not leaking*' { @{ Text = 'Pas de fuite DNS détectée.'; Color = 'Green' } }
+                default               { @{ Text = $conclusion[0].ip; Color = 'Gray' } }
+            }
+            Write-Host ("  Verdict : {0}" -f $verdict.Text) -ForegroundColor $verdict.Color
+            Write-Host "  (La notion de fuite n'a de sens que derrière un VPN : sans VPN, voir les" -ForegroundColor DarkGray
+            Write-Host "  résolveurs de votre FAI ou de votre DNS public habituel est normal.)" -ForegroundColor DarkGray
+        }
+    } catch {
+        Write-Host "  Erreur lors du test : $($_.Exception.Message)" -ForegroundColor Red
     }
 
     Wait-EnterOrEscape
@@ -1868,7 +1987,8 @@ function Start-MainLoop {
 
     # Chaque entree est soit un separateur visuel (Header/Blank, jamais d'Action -> no-op
     # si selectionnee), soit un item actionnable identifie par son nom (evite une dependance
-    # fragile a la position numerique quand la liste est reorganisee).
+    # fragile a la position numerique quand la liste est reorganisee). Les actions "Sub*"
+    # ouvrent un sous-menu thematique defini dans $submenus.
     $menuEntries = @(
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Gestion des interfaces ===' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Modifier une interface réseau'; Action = 'ManageInterface' }
@@ -1877,20 +1997,10 @@ function Start-MainLoop {
         [PSCustomObject]@{ Type = 'Item'; Label = 'Profil réseau (Public / Privé)'; Action = 'Profile' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Outils de diagnostic ===' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'État des interfaces'; Action = 'ConfigExport' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Diagnostic réseau rapide'; Action = 'Diagnostic' }
-        [PSCustomObject]@{ Type = 'Item'; Label = "Statistiques d'interface en direct"; Action = 'Stats' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Quelle est mon IP publique ?'; Action = 'PublicIp' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Résolution DNS (nslookup)'; Action = 'Dns' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Ping'; Action = 'Ping' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Traceroute (tracert)'; Action = 'Tracert' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Test de port TCP'; Action = 'PortTest' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Connexions actives (netstat)'; Action = 'Connections' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Scan du sous-réseau'; Action = 'SubnetScan' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Table ARP (voisins réseau)'; Action = 'Arp' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Réseaux Wi-Fi à proximité'; Action = 'Wifi' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Wake-on-LAN'; Action = 'Wol' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Vider le cache DNS (flushdns)'; Action = 'FlushDns' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Connectivité                   >'; Action = 'SubConnectivity' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'DNS                            >'; Action = 'SubDns' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Réseau local                   >'; Action = 'SubLan' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'État & trafic                  >'; Action = 'SubStatus' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Options ===' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Masquer/afficher des interfaces'; Action = 'Options' }
@@ -1898,6 +2008,32 @@ function Start-MainLoop {
         [PSCustomObject]@{ Type = 'Header'; Label = '===' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Quitter'; Action = 'Quit' }
     )
+
+    $submenus = @{
+        SubConnectivity = @{ Title = 'Connectivité'; Entries = @(
+            [PSCustomObject]@{ Label = 'Diagnostic réseau rapide'; Action = 'Diagnostic' }
+            [PSCustomObject]@{ Label = 'Ping'; Action = 'Ping' }
+            [PSCustomObject]@{ Label = 'Traceroute (tracert)'; Action = 'Tracert' }
+            [PSCustomObject]@{ Label = 'Test de port TCP'; Action = 'PortTest' }
+        ) }
+        SubDns = @{ Title = 'DNS'; Entries = @(
+            [PSCustomObject]@{ Label = 'Résolution DNS (nslookup)'; Action = 'Dns' }
+            [PSCustomObject]@{ Label = 'Test de fuite DNS (dnsleak)'; Action = 'DnsLeak' }
+            [PSCustomObject]@{ Label = 'Vider le cache DNS (flushdns)'; Action = 'FlushDns' }
+        ) }
+        SubLan = @{ Title = 'Réseau local'; Entries = @(
+            [PSCustomObject]@{ Label = 'Scan du sous-réseau'; Action = 'SubnetScan' }
+            [PSCustomObject]@{ Label = 'Table ARP (voisins réseau)'; Action = 'Arp' }
+            [PSCustomObject]@{ Label = 'Réseaux Wi-Fi à proximité'; Action = 'Wifi' }
+            [PSCustomObject]@{ Label = 'Wake-on-LAN'; Action = 'Wol' }
+        ) }
+        SubStatus = @{ Title = 'État & trafic'; Entries = @(
+            [PSCustomObject]@{ Label = 'État des interfaces'; Action = 'ConfigExport' }
+            [PSCustomObject]@{ Label = "Statistiques d'interface en direct"; Action = 'Stats' }
+            [PSCustomObject]@{ Label = 'Connexions actives (netstat)'; Action = 'Connections' }
+            [PSCustomObject]@{ Label = 'Quelle est mon IP publique ?'; Action = 'PublicIp' }
+        ) }
+    }
 
     $items = @($menuEntries | ForEach-Object { $_.Label })
     $lastIndex = 0
@@ -1911,36 +2047,72 @@ function Start-MainLoop {
         $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex
 
         if ($choice -lt 0) {
-            Write-Host "`nÀ bientôt !" -ForegroundColor Cyan
-            return
+            Write-Host ""
+            if (Read-YesNo -Prompt "Quitter le gestionnaire d'interfaces réseau ?" -Default $false) {
+                Write-Host "`nÀ bientôt !" -ForegroundColor Cyan
+                return
+            }
+            continue
         }
 
         $entry = $menuEntries[$choice]
         $lastIndex = $choice
         if ($entry.Type -ne 'Item') { continue }
 
-        switch ($entry.Action) {
-            'ManageInterface' { Show-InterfaceSelectionScreen }
-            'Presets'         { Show-PresetsMenu }
-            'Dhcp'            { Invoke-DhcpReleaseRenew }
-            'Profile'         { Invoke-NetworkProfileManager }
-            'ConfigExport'    { Invoke-ConfigExport }
-            'Diagnostic'      { Invoke-NetworkDiagnostic }
-            'Stats'           { Invoke-InterfaceStatistics }
-            'PublicIp'        { Invoke-PublicIpLookup }
-            'Dns'             { Invoke-DnsLookup }
-            'Ping'            { Invoke-PingHost }
-            'Tracert'         { Invoke-TracertHost }
-            'PortTest'        { Invoke-TcpPortTest }
-            'Connections'     { Invoke-ActiveConnections }
-            'SubnetScan'      { Invoke-SubnetScan }
-            'Arp'             { Invoke-ArpTable }
-            'Wifi'            { Invoke-WifiScan }
-            'Wol'             { Invoke-WakeOnLan }
-            'FlushDns'        { Invoke-FlushDns }
-            'Options'         { Show-OptionsMenu }
-            'Quit'            { Write-Host "`nÀ bientôt !" -ForegroundColor Cyan; return }
+        if ($entry.Action -eq 'Quit') {
+            Write-Host "`nÀ bientôt !" -ForegroundColor Cyan
+            return
         }
+        if ($submenus.ContainsKey($entry.Action)) {
+            $sm = $submenus[$entry.Action]
+            Show-ToolsSubmenu -Title $sm.Title -Entries $sm.Entries
+        } else {
+            Invoke-ToolAction -Action $entry.Action
+        }
+    }
+}
+
+# Dispatch central : associe chaque nom d'action a sa fonction, partage entre le menu
+# principal et les sous-menus thematiques.
+function Invoke-ToolAction {
+    param([string]$Action)
+    switch ($Action) {
+        'ManageInterface' { Show-InterfaceSelectionScreen }
+        'Presets'         { Show-PresetsMenu }
+        'Dhcp'            { Invoke-DhcpReleaseRenew }
+        'Profile'         { Invoke-NetworkProfileManager }
+        'Diagnostic'      { Invoke-NetworkDiagnostic }
+        'Ping'            { Invoke-PingHost }
+        'Tracert'         { Invoke-TracertHost }
+        'PortTest'        { Invoke-TcpPortTest }
+        'Dns'             { Invoke-DnsLookup }
+        'DnsLeak'         { Invoke-DnsLeakTest }
+        'FlushDns'        { Invoke-FlushDns }
+        'SubnetScan'      { Invoke-SubnetScan }
+        'Arp'             { Invoke-ArpTable }
+        'Wifi'            { Invoke-WifiScan }
+        'Wol'             { Invoke-WakeOnLan }
+        'ConfigExport'    { Invoke-ConfigExport }
+        'Stats'           { Invoke-InterfaceStatistics }
+        'Connections'     { Invoke-ActiveConnections }
+        'PublicIp'        { Invoke-PublicIpLookup }
+        'Options'         { Show-OptionsMenu }
+    }
+}
+
+# Sous-menu thematique generique : liste d'outils + retour, position memorisee entre
+# deux outils tant qu'on reste dans le sous-menu, Echap pour remonter au menu principal.
+function Show-ToolsSubmenu {
+    param([string]$Title, $Entries)
+    $lastIndex = 0
+    while ($true) {
+        Clear-Host
+        Write-Host "=== $Title ===" -ForegroundColor Cyan
+        $items = @($Entries | ForEach-Object { $_.Label }) + '<< Retour au menu principal'
+        $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex
+        if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+        $lastIndex = $choice
+        Invoke-ToolAction -Action $Entries[$choice].Action
     }
 }
 
