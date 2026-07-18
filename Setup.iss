@@ -3,7 +3,7 @@
 ; Necessite Inno Setup 6 : https://jrsoftware.org/isinfo.php ou "winget install JRSoftware.InnoSetup"
 
 #define MyAppName "Gestion Interfaces Réseau"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.2.1"
 #define MyScriptFile "Gestion-Interfaces-Reseau.ps1"
 
 [Setup]
