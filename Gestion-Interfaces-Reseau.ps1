@@ -327,7 +327,7 @@ function Get-NetworkInterfacesInfo {
     param([string[]]$ExcludeNames = @())
 
     $adapters = @(Get-NetAdapter | Sort-Object ifIndex)
-    if ($ExcludeNames.Count -gt 0) {
+    if ($ExcludeNames -and $ExcludeNames.Count -gt 0) {
         $adapters = @($adapters | Where-Object { $ExcludeNames -notcontains $_.Name })
     }
     if ($adapters.Count -eq 0) { return @() }
@@ -854,7 +854,10 @@ function Save-HiddenInterfaceNames {
 }
 
 function Get-VisibleInterfaces {
-    $hidden = Get-HiddenInterfaceNames
+    # @() autour de l'appel : un tableau vide renvoyé par une fonction est aplati en
+    # $null par le pipeline de sortie (cas du premier lancement, sans config.json) —
+    # sans ce wrap, $null atteindrait -ExcludeNames et ferait planter .Count plus loin.
+    $hidden = @(Get-HiddenInterfaceNames)
     @(Get-NetworkInterfacesInfo -ExcludeNames $hidden)
 }
 
