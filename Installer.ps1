@@ -36,7 +36,7 @@ $lnkPath = Join-Path $desktopPath 'Gestion Interfaces Reseau.lnk'
 $ws = New-Object -ComObject WScript.Shell
 $shortcut = $ws.CreateShortcut($lnkPath)
 $shortcut.TargetPath = $wtPath
-$shortcut.Arguments = "pwsh -ExecutionPolicy Bypass -File `"$installedScript`""
+$shortcut.Arguments = "pwsh -NoProfile -ExecutionPolicy Bypass -File `"$installedScript`""
 $shortcut.WorkingDirectory = $installDir
 $shortcut.IconLocation = 'C:\Windows\System32\imageres.dll,170'
 $shortcut.Save()

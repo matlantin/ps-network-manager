@@ -30,11 +30,10 @@ function Show-Banner {
     Write-Host $banner -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Bienvenue ! Ce script interactif permet de configurer les interfaces réseau de cette machine." -ForegroundColor Gray
-    Write-Host "  Il fournit également des outils de diagnostic réseau (IP publique, ping, tracert, nslookup)." -ForegroundColor Gray
+    Write-Host "  Il fournit également des presets de configuration IP et des outils de diagnostic réseau." -ForegroundColor Gray
     Write-Host "  Astuce : dans les menus, utilisez les flèches Haut/Bas puis Entrée." -ForegroundColor DarkGray
     Write-Host "  Pour les questions, Entrée seule conserve la valeur actuelle affichée." -ForegroundColor DarkGray
     Write-Host ""
-    Read-Host "  Appuyez sur Entrée pour continuer" | Out-Null
 }
 
 #endregion
@@ -253,40 +252,55 @@ function Show-ArrowMenu {
 
     Write-Host ""
     if ($Title -and -not $TitleAtBottom) { Write-Host $Title -ForegroundColor DarkGray }
-    $top = [Console]::CursorTop
     [Console]::CursorVisible = $false
 
+    # Couleur de repos de chaque ligne, precalculee une seule fois (en-tetes === en DarkCyan).
+    $baseColors = @($Items | ForEach-Object { if ($_ -match '^===') { 'DarkCyan' } else { 'Gray' } })
+
+    $writeLine = {
+        param($i, [bool]$InPlace)
+        $marker = if ($i -eq $selected) { ">" } else { " " }
+        $line = " $marker $($Items[$i])"
+        if ($line.Length -gt $width) { $line = $line.Substring(0, $width) }
+        $line = $line.PadRight($width)
+        $colors = if ($i -eq $selected) { @{ ForegroundColor = 'Black'; BackgroundColor = 'Cyan' } }
+                  else { @{ ForegroundColor = $baseColors[$i] } }
+        Write-Host $line -NoNewline:$InPlace @colors
+    }
+
+    $top = 0
+    $extraLines = 0
     try {
+        # Premier dessin complet, avec sauts de ligne pour laisser le defilement naturel se
+        # produire, puis calcul de la position du haut du menu a partir de la position finale
+        # du curseur : reste juste meme si l'affichage a fait defiler la fenetre.
+        for ($i = 0; $i -lt $Items.Count; $i++) { & $writeLine $i $false }
+        if ($TitleAtBottom -and $Title) {
+            Write-Host ""
+            Write-Host $Title -ForegroundColor DarkGray
+            $extraLines = 2
+        }
+        $top = [Console]::CursorTop - $Items.Count - $extraLines
+
         while ($true) {
-            [Console]::SetCursorPosition(0, $top)
-            for ($i = 0; $i -lt $Items.Count; $i++) {
-                $marker = if ($i -eq $selected) { ">" } else { " " }
-                $line = " $marker $($Items[$i])"
-                if ($line.Length -gt $width) { $line = $line.Substring(0, $width) }
-                $line = $line.PadRight($width)
-                if ($i -eq $selected) {
-                    Write-Host $line -ForegroundColor Black -BackgroundColor Cyan
-                } elseif ($Items[$i] -match '^===') {
-                    Write-Host $line -ForegroundColor DarkCyan
-                } else {
-                    Write-Host $line -ForegroundColor Gray
-                }
-            }
-            if ($TitleAtBottom -and $Title) {
-                Write-Host ""
-                Write-Host $Title -ForegroundColor DarkGray
-            }
-            # Repositionne le curseur texte a un endroit fixe (au lieu de le laisser
-            # apres la derniere ligne) pour eviter qu'il ne "saute" visuellement entre
-            # le haut et le bas de la liste a chaque redessin.
+            # Curseur gare a un endroit fixe pour eviter tout "saut" visuel entre les frappes.
             [Console]::SetCursorPosition(0, $top)
             $key = [Console]::ReadKey($true)
+            $previous = $selected
             switch ($key.Key) {
                 'UpArrow'    { $selected = ($selected - 1 + $Items.Count) % $Items.Count }
                 'DownArrow'  { $selected = ($selected + 1) % $Items.Count }
                 'Enter'      { return $selected }
                 'Spacebar'   { return $selected }
                 'Escape'     { return -1 }
+            }
+            if ($selected -ne $previous) {
+                # Ne redessine que les deux lignes concernees (ancienne et nouvelle selection)
+                # au lieu de la liste entiere : la navigation reste fluide sur les grands menus.
+                [Console]::SetCursorPosition(0, $top + $previous)
+                & $writeLine $previous $true
+                [Console]::SetCursorPosition(0, $top + $selected)
+                & $writeLine $selected $true
             }
         }
     } finally {
@@ -295,6 +309,9 @@ function Show-ArrowMenu {
         # que l'ecran suivant ne soit dessine. Ce sont les fonctions de saisie
         # (Read-WithDefault, Read-YesNo, Read-HostWithEscape) qui le reactivent elles-memes.
         [Console]::CursorVisible = $false
+        # Replace le curseur SOUS le menu : le laisser gare en haut faisait ecrire la suite
+        # de l'affichage par-dessus les lignes du menu (surimpressions constatees).
+        [Console]::SetCursorPosition(0, $top + $Items.Count + $extraLines)
         Write-Host ""
     }
 }
@@ -557,7 +574,11 @@ function Show-PlanSummary {
         return
     }
 
-    Write-Host ("  Mode IP     : {0} -> {1}" -f $Current.Dhcp, $Plan.Mode)
+    # Vocabulaire homogene : l'etat CIM ('Enabled'/'Disabled') est traduit dans les memes
+    # termes que le mode cible, plutot que d'afficher "Enabled -> Static".
+    $modeAvant = switch ($Current.Dhcp) { 'Enabled' { 'DHCP' } 'Disabled' { 'Statique' } default { "$_" } }
+    $modeApres = if ($Plan.Mode -eq 'DHCP') { 'DHCP' } else { 'Statique' }
+    Write-Host ("  Mode IP     : {0} -> {1}" -f $modeAvant, $modeApres)
 
     if ($Plan.Mode -eq 'Static') {
         $ipAvant = if ($Current.IPAddresses.Count -gt 0) { $Current.IPAddresses -join ', ' } else { '(aucune)' }
@@ -659,7 +680,7 @@ function Start-InterfaceWizard {
         Write-Host "Modifications annulées." -ForegroundColor Yellow
     }
 
-    Read-Host "`nAppuyez sur Entrée pour revenir au menu principal" | Out-Null
+    Wait-EnterOrEscape
 }
 
 #endregion
@@ -845,7 +866,7 @@ function Show-InterfaceSelectionScreen {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -854,7 +875,7 @@ function Show-InterfaceSelectionScreen {
     $items = @($interfaces | ForEach-Object { Format-InterfaceLine -Iface $_ })
     $items += "<< Retour au menu principal"
 
-    $choice = Show-ArrowMenu -Title "Utilisez Haut/Bas puis Entrée :" -Items $items -DefaultIndex 0
+    $choice = Show-ArrowMenu -Items $items -DefaultIndex 0
 
     if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
 
@@ -863,21 +884,24 @@ function Show-InterfaceSelectionScreen {
 
 function Show-OptionsMenu {
     $lastIndex = 0
+    # Les interfaces sont interrogees une seule fois : basculer la visibilite ne change que
+    # le fichier de preferences, pas le materiel — inutile de refaire les requetes CIM a
+    # chaque bascule.
+    $allIfaces = @(Get-NetworkInterfacesInfo)
+    if ($allIfaces.Count -eq 0) {
+        Write-Host "Aucune interface réseau trouvée." -ForegroundColor Red
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        return
+    }
+
     while ($true) {
         $hidden = @(Get-HiddenInterfaceNames)
-        $allIfaces = @(Get-NetworkInterfacesInfo)
 
         Clear-Host
         Write-Host "=== Options : interfaces visibles dans les listes ===" -ForegroundColor Cyan
         Write-Host "  Sélectionnez une interface pour basculer Masquer/Afficher." -ForegroundColor DarkGray
         Write-Host ("  Fichier de config : {0}" -f (Get-ConfigPath)) -ForegroundColor DarkGray
         Write-Host ""
-
-        if ($allIfaces.Count -eq 0) {
-            Write-Host "Aucune interface réseau trouvée." -ForegroundColor Red
-            Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
-            return
-        }
 
         $items = @($allIfaces | ForEach-Object {
             $state = if ($hidden -contains $_.Name) { 'Masquée' } else { 'Visible' }
@@ -909,14 +933,14 @@ function Invoke-FlushDns {
     } catch {
         Write-Host "Erreur lors du vidage du cache DNS : $($_.Exception.Message)" -ForegroundColor Red
     }
-    Read-Host "`nAppuyez sur Entrée pour revenir au menu principal" | Out-Null
+    Wait-EnterOrEscape
 }
 
 function Invoke-DhcpReleaseRenew {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -952,7 +976,7 @@ function Invoke-DhcpReleaseRenew {
         Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
     }
 
-    Read-Host "`nAppuyez sur Entrée pour revenir au menu principal" | Out-Null
+    Wait-EnterOrEscape
 }
 
 function Invoke-PublicIpLookup {
@@ -1078,7 +1102,7 @@ function Invoke-InterfaceStatistics {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -1157,7 +1181,7 @@ function Invoke-NetworkProfileManager {
     $profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
     if ($profiles.Count -eq 0) {
         Write-Host "Aucun profil réseau trouvé." -ForegroundColor Red
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -1169,7 +1193,7 @@ function Invoke-NetworkProfileManager {
 
     if ($target.NetworkCategory -eq 'DomainAuthenticated') {
         Write-Host "`nCette interface est gérée par le domaine (DomainAuthenticated) : catégorie non modifiable manuellement." -ForegroundColor Yellow
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -1210,8 +1234,13 @@ function Invoke-ActiveConnections {
             Get-NetTCPConnection -ErrorAction Stop
         }
 
+        # Un seul Get-Process indexe par PID, au lieu d'un appel par connexion
+        # (plusieurs centaines de connexions = plusieurs centaines d'appels evites).
+        $procById = @{}
+        foreach ($p in Get-Process -ErrorAction SilentlyContinue) { $procById[$p.Id] = $p.ProcessName }
+
         $rows = @($connections | ForEach-Object {
-            $procName = try { (Get-Process -Id $_.OwningProcess -ErrorAction Stop).ProcessName } catch { '?' }
+            $procName = if ($procById.ContainsKey([int]$_.OwningProcess)) { $procById[[int]$_.OwningProcess] } else { '?' }
             [PSCustomObject]@{
                 'Local'     = "$($_.LocalAddress):$($_.LocalPort)"
                 'Distant'   = "$($_.RemoteAddress):$($_.RemotePort)"
@@ -1256,6 +1285,280 @@ function Invoke-WifiScan {
     Wait-EnterOrEscape
 }
 
+function Invoke-TcpPortTest {
+    Clear-Host
+    Write-Host "=== Test de port TCP ===" -ForegroundColor Cyan
+    Write-Host "  Échap pour revenir au menu principal." -ForegroundColor DarkGray
+    Write-Host ""
+    $lastTarget = ''
+    while ($true) {
+        $target = Read-HostWithEscape -Prompt "Hôte ou adresse IP" -Default $lastTarget
+        if ($null -eq $target) { return }
+        if ([string]::IsNullOrWhiteSpace($target)) { continue }
+        $lastTarget = $target
+
+        $portInput = Read-HostWithEscape -Prompt "Port (1-65535)"
+        if ($null -eq $portInput) { return }
+        $port = 0
+        if (-not [int]::TryParse($portInput, [ref]$port) -or $port -lt 1 -or $port -gt 65535) {
+            Write-Host "  Port invalide." -ForegroundColor Yellow
+            continue
+        }
+
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            $task = $client.ConnectAsync($target, $port)
+            if ($task.Wait(3000) -and $client.Connected) {
+                Write-Host ("  {0}:{1} -> OUVERT ({2} ms)" -f $target, $port, $sw.ElapsedMilliseconds) -ForegroundColor Green
+            } else {
+                Write-Host ("  {0}:{1} -> fermé ou filtré (délai de 3 s dépassé)" -f $target, $port) -ForegroundColor Red
+            }
+        } catch {
+            $reason = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+            Write-Host ("  {0}:{1} -> fermé ({2})" -f $target, $port, $reason) -ForegroundColor Red
+        } finally {
+            $client.Dispose()
+        }
+        Write-Host ""
+    }
+}
+
+function Invoke-SubnetScan {
+    Clear-Host
+    Write-Host "=== Scan du sous-réseau ===" -ForegroundColor Cyan
+    Write-Host "  Ping parallèle de chaque adresse, puis récupération des MAC (table ARP) et des noms." -ForegroundColor DarkGray
+    Write-Host ""
+
+    # Sous-reseau propose par defaut : celui de la premiere interface active avec passerelle
+    # (la plus susceptible d'etre le LAN principal), ramene a son adresse de reseau.
+    $defaultCidr = ''
+    $candidates = @(Get-VisibleInterfaces | Where-Object { $_.Status -eq 'Up' -and $_.IPAddresses.Count -gt 0 -and $_.Gateway })
+    if ($candidates.Count -gt 0 -and $candidates[0].IPAddresses[0] -match '^(?<ip>[\d.]+)/(?<prefix>\d+)$') {
+        $prefix = [int]$Matches.prefix
+        $ipBytes = ([System.Net.IPAddress]::Parse($Matches.ip)).GetAddressBytes()
+        $ipValue = ([int64]$ipBytes[0] -shl 24) -bor ([int64]$ipBytes[1] -shl 16) -bor ([int64]$ipBytes[2] -shl 8) -bor [int64]$ipBytes[3]
+        $maskValue = if ($prefix -eq 0) { [int64]0 } else { (0xFFFFFFFFL -shl (32 - $prefix)) -band 0xFFFFFFFFL }
+        $network = $ipValue -band $maskValue
+        $defaultCidr = "{0}.{1}.{2}.{3}/{4}" -f (($network -shr 24) -band 0xFF), (($network -shr 16) -band 0xFF), (($network -shr 8) -band 0xFF), ($network -band 0xFF), $prefix
+    }
+
+    $cidr = Read-CidrWithDefault -Prompt "Sous-réseau à scanner" -Default $defaultCidr
+    if ($cidr -notmatch '^(?<ip>[\d.]+)/(?<prefix>\d+)$') { return }
+    $prefix = [int]$Matches.prefix
+    if ($prefix -gt 30) {
+        Write-Host "  Préfixe trop étroit (/31 ou /32) : rien à scanner." -ForegroundColor Yellow
+        Wait-EnterOrEscape
+        return
+    }
+
+    $ipBytes = ([System.Net.IPAddress]::Parse($Matches.ip)).GetAddressBytes()
+    $ipValue = ([int64]$ipBytes[0] -shl 24) -bor ([int64]$ipBytes[1] -shl 16) -bor ([int64]$ipBytes[2] -shl 8) -bor [int64]$ipBytes[3]
+    $maskValue = (0xFFFFFFFFL -shl (32 - $prefix)) -band 0xFFFFFFFFL
+    $network = $ipValue -band $maskValue
+    $broadcast = $network -bor ((-bnot $maskValue) -band 0xFFFFFFFFL)
+    $count = $broadcast - $network - 1
+
+    if ($count -gt 1024 -and -not (Read-YesNo -Prompt "$count adresses à scanner, cela peut prendre du temps. Continuer ?" -Default $false)) {
+        return
+    }
+
+    $ips = for ($v = $network + 1; $v -lt $broadcast; $v++) {
+        "{0}.{1}.{2}.{3}" -f (($v -shr 24) -band 0xFF), (($v -shr 16) -band 0xFF), (($v -shr 8) -band 0xFF), ($v -band 0xFF)
+    }
+
+    Write-Host ""
+    Write-Host "Scan de $count adresses en cours..." -ForegroundColor Yellow
+
+    # PS7 : ping massivement parallele (64 a la fois, timeout 300 ms), et resolution DNS
+    # inversee limitee a 1,5 s uniquement pour les hotes qui repondent.
+    $active = @($ips | ForEach-Object -Parallel {
+        $ping = [System.Net.NetworkInformation.Ping]::new()
+        try {
+            $reply = $ping.Send($_, 300)
+            if ($reply.Status -eq 'Success') {
+                $name = ''
+                try {
+                    $dnsTask = [System.Net.Dns]::GetHostEntryAsync($_)
+                    if ($dnsTask.Wait(1500)) { $name = $dnsTask.Result.HostName }
+                } catch {}
+                [PSCustomObject]@{ IP = $_; Nom = $name; 'Latence (ms)' = $reply.RoundtripTime }
+            }
+        } catch {} finally { $ping.Dispose() }
+    } -ThrottleLimit 64)
+
+    # Les pings viennent de remplir la table ARP : on y recupere les MAC des hotes trouves.
+    $macByIp = @{}
+    foreach ($n in (Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue)) {
+        if ($n.LinkLayerAddress -and $n.LinkLayerAddress -ne '00-00-00-00-00-00') {
+            $macByIp[$n.IPAddress] = $n.LinkLayerAddress
+        }
+    }
+
+    Write-Host ""
+    if ($active.Count -eq 0) {
+        Write-Host "Aucun hôte actif trouvé." -ForegroundColor Yellow
+    } else {
+        Write-Host "$($active.Count) hôte(s) actif(s) :" -ForegroundColor Green
+        $active | ForEach-Object {
+            [PSCustomObject]@{
+                IP            = $_.IP
+                MAC           = if ($macByIp.ContainsKey($_.IP)) { $macByIp[$_.IP] } else { '' }
+                Nom           = $_.Nom
+                'Latence (ms)' = $_.'Latence (ms)'
+            }
+        } | Sort-Object { [version]$_.IP } | Format-Table -AutoSize | Out-String | Write-Host
+    }
+
+    Wait-EnterOrEscape
+}
+
+function Invoke-ArpTable {
+    Clear-Host
+    Write-Host "=== Table ARP (voisins réseau) ===" -ForegroundColor Cyan
+    Write-Host "  Correspondances IP / MAC récemment vues par cette machine." -ForegroundColor DarkGray
+    Write-Host ""
+
+    $neighbors = @(Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.State -in 'Reachable', 'Stale', 'Permanent', 'Delay', 'Probe' -and
+        $_.LinkLayerAddress -and
+        $_.LinkLayerAddress -ne '00-00-00-00-00-00' -and
+        $_.IPAddress -notmatch '^(22[4-9]|23\d)\.' -and
+        $_.IPAddress -ne '255.255.255.255'
+    })
+
+    if ($neighbors.Count -eq 0) {
+        Write-Host "Aucun voisin dans la table ARP." -ForegroundColor Yellow
+    } else {
+        $neighbors | ForEach-Object {
+            [PSCustomObject]@{
+                IP        = $_.IPAddress
+                MAC       = $_.LinkLayerAddress
+                'État'    = $_.State
+                Interface = $_.InterfaceAlias
+            }
+        } | Sort-Object Interface, { [version]$_.IP } | Format-Table -AutoSize | Out-String | Write-Host
+    }
+
+    Wait-EnterOrEscape
+}
+
+#region Wake-on-LAN
+
+function Get-WolHostsPath {
+    Join-Path $env:LOCALAPPDATA 'NetIfaceManager\wol-hosts.json'
+}
+
+function Get-WolHosts {
+    $path = Get-WolHostsPath
+    if (-not (Test-Path $path)) { return @() }
+    try {
+        @(Get-Content -Path $path -Raw | ConvertFrom-Json)
+    } catch {
+        @()
+    }
+}
+
+function Save-WolHosts {
+    param($WolHosts)
+    $path = Get-WolHostsPath
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    ConvertTo-Json -InputObject @($WolHosts) | Set-Content -Path $path -Encoding UTF8
+}
+
+function Test-MacAddress {
+    param([string]$InputValue)
+    $InputValue -match '^([0-9A-Fa-f]{2}[:\-\.]?){5}[0-9A-Fa-f]{2}$'
+}
+
+function Send-MagicPacket {
+    param([string]$Mac)
+    $clean = $Mac -replace '[:\-\.]', ''
+    $macBytes = [byte[]]@(for ($i = 0; $i -lt 12; $i += 2) { [Convert]::ToByte($clean.Substring($i, 2), 16) })
+    # Magic packet : 6 octets 0xFF suivis de la MAC repetee 16 fois, en broadcast UDP.
+    $packet = [byte[]]@((,0xFF * 6) + ($macBytes * 16))
+    $udp = [System.Net.Sockets.UdpClient]::new()
+    try {
+        $udp.EnableBroadcast = $true
+        # Ports 9 (discard) et 7 (echo) : les deux conventions les plus repandues.
+        foreach ($port in 9, 7) {
+            [void]$udp.Send($packet, $packet.Length, [System.Net.IPEndPoint]::new([System.Net.IPAddress]::Broadcast, $port))
+        }
+    } finally {
+        $udp.Dispose()
+    }
+}
+
+function Invoke-WakeOnLan {
+    while ($true) {
+        $wolHosts = @(Get-WolHosts)
+
+        Clear-Host
+        Write-Host "=== Wake-on-LAN ===" -ForegroundColor Cyan
+        Write-Host "  Envoie un magic packet en broadcast pour réveiller une machine du réseau local." -ForegroundColor DarkGray
+        Write-Host ""
+
+        $items = @($wolHosts | ForEach-Object { "{0,-25} {1}" -f $_.Name, $_.Mac })
+        $items += "Nouvelle adresse MAC..."
+        if ($wolHosts.Count -gt 0) { $items += "Supprimer un hôte enregistré" }
+        $items += "<< Retour au menu principal"
+
+        $choice = Show-ArrowMenu -Title "Sélectionnez un hôte ou une action :" -Items $items -DefaultIndex 0
+        if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+
+        if ($wolHosts.Count -gt 0 -and $choice -eq $items.Count - 2) {
+            $delItems = @($wolHosts | ForEach-Object { "{0,-25} {1}" -f $_.Name, $_.Mac }) + '<< Annuler'
+            $delChoice = Show-ArrowMenu -Title "Hôte à supprimer :" -Items $delItems -DefaultIndex 0
+            if ($delChoice -ge 0 -and $delChoice -lt $wolHosts.Count) {
+                Save-WolHosts -WolHosts @($wolHosts | Where-Object { $_ -ne $wolHosts[$delChoice] })
+            }
+            continue
+        }
+
+        if ($choice -lt $wolHosts.Count) {
+            $target = $wolHosts[$choice]
+            try {
+                Send-MagicPacket -Mac $target.Mac
+                Write-Host "`nMagic packet envoyé à $($target.Name) ($($target.Mac))." -ForegroundColor Green
+            } catch {
+                Write-Host "`nErreur lors de l'envoi : $($_.Exception.Message)" -ForegroundColor Red
+            }
+            Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+            continue
+        }
+
+        # "Nouvelle adresse MAC..."
+        while ($true) {
+            $mac = Read-HostWithEscape -Prompt "Adresse MAC (ex: AA:BB:CC:DD:EE:FF)"
+            if ($null -eq $mac) { break }
+            if ([string]::IsNullOrWhiteSpace($mac)) { continue }
+            if (-not (Test-MacAddress -InputValue $mac)) {
+                Write-Host "  Adresse MAC invalide." -ForegroundColor Yellow
+                continue
+            }
+
+            try {
+                Send-MagicPacket -Mac $mac
+                Write-Host "Magic packet envoyé ($mac)." -ForegroundColor Green
+            } catch {
+                Write-Host "Erreur lors de l'envoi : $($_.Exception.Message)" -ForegroundColor Red
+                break
+            }
+
+            if (Read-YesNo -Prompt "Enregistrer cet hôte pour la prochaine fois ?" -Default $true) {
+                $name = Read-HostWithEscape -Prompt "Nom de l'hôte"
+                if (-not [string]::IsNullOrWhiteSpace($name)) {
+                    Save-WolHosts -WolHosts (@($wolHosts) + [PSCustomObject]@{ Name = $name; Mac = $mac.ToUpper() })
+                }
+            }
+            break
+        }
+    }
+}
+
+#endregion
+
 function Invoke-ConfigExport {
     Clear-Host
     Write-Host "=== Résumé de la configuration réseau ===" -ForegroundColor Cyan
@@ -1264,7 +1567,7 @@ function Invoke-ConfigExport {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -1326,7 +1629,7 @@ function Invoke-ApplyPresetToInterface {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -1431,10 +1734,14 @@ function Show-PresetDetailMenu {
 function Invoke-PresetsExport {
     param($Presets)
 
+    Clear-Host
+    Write-Host "=== Exporter les presets (.zip) ===" -ForegroundColor Cyan
+    Write-Host ""
+
     $customPresets = @($Presets | Where-Object { -not $_.IsBuiltin })
     if ($customPresets.Count -eq 0) {
-        Write-Host "`nAucun preset personnalisé à exporter (le preset DHCP système n'est pas un fichier)." -ForegroundColor Yellow
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Write-Host "Aucun preset personnalisé à exporter (le preset DHCP système n'est pas un fichier)." -ForegroundColor Yellow
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -1450,7 +1757,7 @@ function Invoke-PresetsExport {
         Write-Host "`nErreur lors de l'export : $($_.Exception.Message)" -ForegroundColor Red
     }
 
-    Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+    Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
 }
 
 function Invoke-PresetsImport {
@@ -1462,7 +1769,7 @@ function Invoke-PresetsImport {
     if ($null -eq $zipPath) { return }
     if ([string]::IsNullOrWhiteSpace($zipPath) -or -not (Test-Path $zipPath)) {
         Write-Host "Fichier introuvable." -ForegroundColor Red
-        Read-Host "Appuyez sur Entrée pour continuer" | Out-Null
+        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
         return
     }
 
@@ -1512,7 +1819,7 @@ function Invoke-PresetsImport {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Read-Host "`nAppuyez sur Entrée pour continuer" | Out-Null
+    Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
 }
 
 function Show-PresetsMenu {
@@ -1550,11 +1857,14 @@ function Show-PresetsMenu {
 function Start-MainLoop {
     Show-Banner
 
-    # Precharge les modules reseau maintenant plutot qu'au premier clic sur "Gerer une
-    # interface" : PowerShell ne les charge en memoire qu'au premier appel a une de leurs
-    # cmdlets, ce qui causait un petit ralentissement perceptible a la premiere ouverture
-    # du menu. Le cout total est identique, mais absorbe ici pendant l'affichage de la banniere.
+    # Le prompt est affiche AVANT le prechargement des modules reseau : l'import (~2s a
+    # froid) s'execute pendant que l'utilisateur lit la banniere, et une frappe Entree
+    # donnee pendant l'import reste dans le tampon console — elle est consommee des la
+    # fin du chargement. Le cout de l'autoload est ainsi reellement masque, la ou un
+    # Read-Host avant l'import le faisait payer plein pot a la transition vers le menu.
+    Write-Host "  Appuyez sur Entrée pour continuer" -ForegroundColor DarkGray
     Import-Module -Name NetAdapter, NetTCPIP, DnsClient -ErrorAction SilentlyContinue
+    while ([Console]::ReadKey($true).Key -ne 'Enter') { }
 
     # Chaque entree est soit un separateur visuel (Header/Blank, jamais d'Action -> no-op
     # si selectionnee), soit un item actionnable identifie par son nom (evite une dependance
@@ -1574,8 +1884,12 @@ function Start-MainLoop {
         [PSCustomObject]@{ Type = 'Item'; Label = 'Résolution DNS (nslookup)'; Action = 'Dns' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Ping'; Action = 'Ping' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Traceroute (tracert)'; Action = 'Tracert' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Test de port TCP'; Action = 'PortTest' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Connexions actives (netstat)'; Action = 'Connections' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Scan du sous-réseau'; Action = 'SubnetScan' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Table ARP (voisins réseau)'; Action = 'Arp' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Réseaux Wi-Fi à proximité'; Action = 'Wifi' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Wake-on-LAN'; Action = 'Wol' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Vider le cache DNS (flushdns)'; Action = 'FlushDns' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Options ===' }
@@ -1617,8 +1931,12 @@ function Start-MainLoop {
             'Dns'             { Invoke-DnsLookup }
             'Ping'            { Invoke-PingHost }
             'Tracert'         { Invoke-TracertHost }
+            'PortTest'        { Invoke-TcpPortTest }
             'Connections'     { Invoke-ActiveConnections }
+            'SubnetScan'      { Invoke-SubnetScan }
+            'Arp'             { Invoke-ArpTable }
             'Wifi'            { Invoke-WifiScan }
+            'Wol'             { Invoke-WakeOnLan }
             'FlushDns'        { Invoke-FlushDns }
             'Options'         { Show-OptionsMenu }
             'Quit'            { Write-Host "`nÀ bientôt !" -ForegroundColor Cyan; return }

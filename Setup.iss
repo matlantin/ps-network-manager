@@ -3,7 +3,7 @@
 ; Necessite Inno Setup 6 : https://jrsoftware.org/isinfo.php ou "winget install JRSoftware.InnoSetup"
 
 #define MyAppName "Gestion Interfaces Réseau"
-#define MyAppVersion "1.0"
+#define MyAppVersion "1.1.0"
 #define MyScriptFile "Gestion-Interfaces-Reseau.ps1"
 
 [Setup]
@@ -30,7 +30,7 @@ Source: "{#MyScriptFile}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userdesktop}\{#MyAppName}"; Filename: "{code:GetWtPath}"; \
-    Parameters: "pwsh -ExecutionPolicy Bypass -File ""{app}\{#MyScriptFile}"""; \
+    Parameters: "pwsh -NoProfile -ExecutionPolicy Bypass -File ""{app}\{#MyScriptFile}"""; \
     WorkingDir: "{app}"; IconFilename: "{sys}\imageres.dll"; IconIndex: 170
 
 [Code]
