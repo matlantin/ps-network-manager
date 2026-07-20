@@ -1,5 +1,5 @@
 ; Script Inno Setup pour Gestion Interfaces Réseau
-; Compilation : ISCC.exe Setup.iss  (genere Output\Installateur-Gestion-Interfaces-Reseau.exe)
+; Compilation : ISCC.exe Setup.iss  (genere Installer\ps-network-manager.exe)
 ; Necessite Inno Setup 6 : https://jrsoftware.org/isinfo.php ou "winget install JRSoftware.InnoSetup"
 
 #define MyAppName "Gestion Interfaces Réseau"
@@ -13,8 +13,8 @@ DefaultDirName={localappdata}\NetIfaceManager
 DisableDirPage=yes
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
-OutputDir=Output
-OutputBaseFilename=Install-Gestion-Reseau
+OutputDir=Installer
+OutputBaseFilename=ps-network-manager
 Compression=lzma
 SolidCompression=yes
 PrivilegesRequired=lowest
