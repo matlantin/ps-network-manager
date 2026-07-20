@@ -280,7 +280,11 @@ function Show-ArrowMenu {
             Write-Host $Title -ForegroundColor DarkGray
             $extraLines = 2
         }
-        $top = [Console]::CursorTop - $Items.Count - $extraLines
+        # Clamp a 0 : si la liste est plus haute que le buffer console, l'affichage a defile
+        # et CursorTop est plafonne au bas du buffer, ce qui rendrait $top negatif — puis
+        # ferait planter SetCursorPosition. On evite le crash au prix d'un rendu imparfait
+        # pour les listes geantes (rares : la plupart des menus tiennent a l'ecran).
+        $top = [Math]::Max(0, [Console]::CursorTop - $Items.Count - $extraLines)
 
         while ($true) {
             # Curseur gare a un endroit fixe pour eviter tout "saut" visuel entre les frappes.
@@ -1423,16 +1427,31 @@ function Invoke-SubnetScan {
     Write-Host ""
     if ($active.Count -eq 0) {
         Write-Host "Aucun hôte actif trouvé." -ForegroundColor Yellow
-    } else {
-        Write-Host "$($active.Count) hôte(s) actif(s) :" -ForegroundColor Green
-        $active | ForEach-Object {
-            [PSCustomObject]@{
-                IP            = $_.IP
-                MAC           = if ($macByIp.ContainsKey($_.IP)) { $macByIp[$_.IP] } else { '' }
-                Nom           = $_.Nom
-                'Latence (ms)' = $_.'Latence (ms)'
-            }
-        } | Sort-Object { [version]$_.IP } | Format-Table -AutoSize | Out-String | Write-Host
+        Wait-EnterOrEscape
+        return
+    }
+
+    $results = @($active | ForEach-Object {
+        [PSCustomObject]@{
+            IP            = $_.IP
+            MAC           = if ($macByIp.ContainsKey($_.IP)) { $macByIp[$_.IP] } else { '' }
+            Nom           = $_.Nom
+            'Latence (ms)' = $_.'Latence (ms)'
+        }
+    } | Sort-Object { [version]$_.IP })
+
+    Write-Host "$($results.Count) hôte(s) actif(s) :" -ForegroundColor Green
+    $results | Format-Table -AutoSize | Out-String | Write-Host
+
+    if (Read-YesNo -Prompt "Exporter ce résultat dans un fichier CSV ?" -Default $false) {
+        $defaultPath = Join-Path ([Environment]::GetFolderPath('Desktop')) ("Scan-Reseau-{0}.csv" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+        $exportPath = Read-WithDefault -Prompt "Chemin du fichier" -Default $defaultPath
+        try {
+            $results | Export-Csv -Path $exportPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+            Write-Host "`nExporté vers : $exportPath" -ForegroundColor Green
+        } catch {
+            Write-Host "`nErreur lors de l'export : $($_.Exception.Message)" -ForegroundColor Red
+        }
     }
 
     Wait-EnterOrEscape
@@ -1467,6 +1486,297 @@ function Invoke-ArpTable {
 
     Wait-EnterOrEscape
 }
+
+# Convertit une valeur entiere 32 bits (int64, pour eviter les soucis de signe avec
+# 255.255.255.255) en notation decimale pointee.
+function ConvertTo-DottedDecimal {
+    param([int64]$Value)
+    "{0}.{1}.{2}.{3}" -f (($Value -shr 24) -band 0xFF), (($Value -shr 16) -band 0xFF), (($Value -shr 8) -band 0xFF), ($Value -band 0xFF)
+}
+
+# Longueur de prefixe (0-32) -> masque decimal pointe ("255.255.255.0"), format attendu
+# par route.exe.
+function ConvertFrom-PrefixLength {
+    param([int]$PrefixLength)
+    $maskValue = if ($PrefixLength -eq 0) { [int64]0 } else { (0xFFFFFFFFL -shl (32 - $PrefixLength)) -band 0xFFFFFFFFL }
+    ConvertTo-DottedDecimal $maskValue
+}
+
+function Invoke-SubnetCalculator {
+    Clear-Host
+    Write-Host "=== Calculateur de sous-réseau ===" -ForegroundColor Cyan
+    Write-Host "  Échap pour revenir au menu principal." -ForegroundColor DarkGray
+    Write-Host ""
+
+    while ($true) {
+        $entry = Read-HostWithEscape -Prompt "Adresse IP + masque (ex: 192.168.1.10/24 ou 192.168.1.10 255.255.255.0)"
+        if ($null -eq $entry) { return }
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+
+        # Accepte "ip/masque" ou "ip masque" (masque en CIDR ou decimal pointe) en une seule
+        # ligne, ou "ip" seul auquel cas le masque est demande sur une seconde ligne (meme
+        # comportement que l'assistant de configuration d'interface).
+        $entry = $entry.Trim()
+        $ipPart = $null
+        $maskPart = $null
+        if ($entry -match '^(?<ip>\S+)\s*[/ ]\s*(?<mask>\S+)$') {
+            $ipPart = $Matches.ip
+            $maskPart = $Matches.mask
+        } else {
+            $ipPart = $entry
+        }
+
+        if (-not (Test-IPv4Address -InputValue $ipPart)) {
+            Write-Host "  Adresse IPv4 invalide (ex: 192.168.1.10)." -ForegroundColor Yellow
+            continue
+        }
+
+        if ($null -eq $maskPart) {
+            $prefix = Read-SubnetMaskWithDefault -Prompt "  Masque de sous-réseau (CIDR /24 ou décimal 255.255.255.0)"
+        } else {
+            $prefix = ConvertTo-PrefixLength -InputValue $maskPart
+            if ($null -eq $prefix) {
+                Write-Host "  Masque invalide. Attendu : /24 ou 255.255.255.0" -ForegroundColor Yellow
+                continue
+            }
+        }
+
+        $ipBytes = ([System.Net.IPAddress]::Parse($ipPart)).GetAddressBytes()
+        $ipValue = ([int64]$ipBytes[0] -shl 24) -bor ([int64]$ipBytes[1] -shl 16) -bor ([int64]$ipBytes[2] -shl 8) -bor [int64]$ipBytes[3]
+        $maskValue = if ($prefix -eq 0) { [int64]0 } else { (0xFFFFFFFFL -shl (32 - $prefix)) -band 0xFFFFFFFFL }
+        $wildcardValue = (-bnot $maskValue) -band 0xFFFFFFFFL
+        $network = $ipValue -band $maskValue
+        $broadcast = $network -bor $wildcardValue
+
+        # /31 (RFC 3021, liaisons point-a-point) et /32 (hote unique) n'ont pas de
+        # broadcast utile : les deux adresses de la plage sont utilisables telles quelles.
+        if ($prefix -eq 32) {
+            $hostCount = 1; $firstHost = $network; $lastHost = $network
+        } elseif ($prefix -eq 31) {
+            $hostCount = 2; $firstHost = $network; $lastHost = $broadcast
+        } else {
+            $hostCount = $broadcast - $network - 1
+            $firstHost = $network + 1
+            $lastHost = $broadcast - 1
+        }
+
+        Write-Host ""
+        Write-Host ("  Adresse réseau    : {0}/{1}" -f (ConvertTo-DottedDecimal $network), $prefix)
+        Write-Host ("  Masque            : {0}" -f (ConvertTo-DottedDecimal $maskValue))
+        Write-Host ("  Wildcard mask     : {0}" -f (ConvertTo-DottedDecimal $wildcardValue))
+        Write-Host ("  Broadcast         : {0}" -f (ConvertTo-DottedDecimal $broadcast))
+        Write-Host ("  Plage d'hôtes     : {0} - {1}" -f (ConvertTo-DottedDecimal $firstHost), (ConvertTo-DottedDecimal $lastHost))
+        Write-Host ("  Hôtes utilisables : {0}" -f $hostCount)
+        Write-Host ""
+    }
+}
+
+function Invoke-IpConverter {
+    Clear-Host
+    Write-Host "=== Convertisseur d'adresses IP ===" -ForegroundColor Cyan
+    Write-Host "  Échap pour revenir au menu principal." -ForegroundColor DarkGray
+    Write-Host ""
+
+    while ($true) {
+        $target = Read-HostWithEscape -Prompt "Adresse IPv4 (ex: 192.168.1.10)"
+        if ($null -eq $target) { return }
+        if ([string]::IsNullOrWhiteSpace($target)) { continue }
+        if (-not (Test-IPv4Address -InputValue $target)) {
+            Write-Host "  Adresse IPv4 invalide." -ForegroundColor Yellow
+            continue
+        }
+
+        $bytes = ([System.Net.IPAddress]::Parse($target)).GetAddressBytes()
+        $decimalValue = ([int64]$bytes[0] -shl 24) -bor ([int64]$bytes[1] -shl 16) -bor ([int64]$bytes[2] -shl 8) -bor [int64]$bytes[3]
+        $hexDotted = ($bytes | ForEach-Object { "{0:X2}" -f $_ }) -join '.'
+        $hexSingle = "0x{0:X8}" -f $decimalValue
+        $binDotted = ($bytes | ForEach-Object { [Convert]::ToString($_, 2).PadLeft(8, '0') }) -join '.'
+        $binSingle = [Convert]::ToString($decimalValue, 2).PadLeft(32, '0')
+
+        Write-Host ""
+        Write-Host ("  Décimal pointé   : {0}" -f $target)
+        Write-Host ("  Décimal (entier) : {0}" -f $decimalValue)
+        Write-Host ("  Hexadécimal      : {0}  ({1})" -f $hexDotted, $hexSingle)
+        Write-Host ("  Binaire          : {0}" -f $binDotted)
+        Write-Host ("                     {0}" -f $binSingle)
+        Write-Host ""
+    }
+}
+
+#region Table de routage
+
+# Liste des routes IPv4 actives, chacune annotee d'un indicateur "persistante" obtenu
+# en croisant avec le PersistentStore (les routes -p survivent au redemarrage).
+function Get-Ipv4RouteList {
+    $persistent = @{}
+    foreach ($r in @(Get-NetRoute -AddressFamily IPv4 -PolicyStore PersistentStore -ErrorAction SilentlyContinue)) {
+        $persistent["$($r.DestinationPrefix)|$($r.NextHop)"] = $true
+    }
+    @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+        [PSCustomObject]@{
+            Destination = $_.DestinationPrefix
+            Gateway     = $_.NextHop
+            Interface   = $_.InterfaceAlias
+            Metric      = $_.RouteMetric
+            Persistante = if ($persistent.ContainsKey("$($_.DestinationPrefix)|$($_.NextHop)")) { 'Oui' } else { 'Non' }
+        }
+    } | Sort-Object { try { [version](($_.Destination -split '/')[0]) } catch { [version]'0.0.0.0' } }, Metric)
+}
+
+function Show-RouteTable {
+    Clear-Host
+    Write-Host "=== Table de routage IPv4 (équivalent route print) ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Par defaut on montre tout (comme route print). Repondre "non" masque les routes
+    # automatiques de Windows (on-link, multicast, broadcast, loopback, link-local) pour
+    # ne garder que les routes a passerelle explicite.
+    $showSystem = Read-YesNo -Prompt "Afficher les routes système/automatiques (multicast, broadcast, on-link...) ?" -Default $true
+
+    $routes = @(Get-Ipv4RouteList)
+    if (-not $showSystem) {
+        $routes = @($routes | Where-Object { $_.Gateway -ne '0.0.0.0' -and $_.Gateway -ne '::' })
+    }
+
+    Write-Host ""
+    if ($routes.Count -eq 0) {
+        Write-Host "Aucune route à afficher." -ForegroundColor Yellow
+    } else {
+        $routes | Format-Table Destination, Gateway, Interface, Metric, Persistante -AutoSize | Out-String | Write-Host
+    }
+    Wait-EnterOrEscape
+}
+
+function Invoke-AddRoute {
+    Clear-Host
+    Write-Host "=== Ajouter une route ===" -ForegroundColor Cyan
+    Write-Host "  Échap pour annuler." -ForegroundColor DarkGray
+    Write-Host ""
+
+    # 1. Destination, avec masque optionnel sur la meme ligne (CIDR /24 ou decimal pointe).
+    $entry = Read-HostWithEscape -Prompt "Destination (réseau ou hôte, ex : 10.0.0.0/24 ou 10.0.0.0)"
+    if ($null -eq $entry -or [string]::IsNullOrWhiteSpace($entry)) { return }
+    $entry = $entry.Trim()
+    $ipPart = $null
+    $maskPart = $null
+    if ($entry -match '^(?<ip>\S+)\s*[/ ]\s*(?<mask>\S+)$') {
+        $ipPart = $Matches.ip
+        $maskPart = $Matches.mask
+    } else {
+        $ipPart = $entry
+    }
+    if (-not (Test-IPv4Address -InputValue $ipPart)) {
+        Write-Host "  Adresse de destination invalide." -ForegroundColor Yellow
+        Wait-EnterOrEscape
+        return
+    }
+
+    # 2. Masque demande sur une seconde ligne uniquement s'il n'etait pas dans la saisie 1.
+    if ($null -eq $maskPart) {
+        $prefix = Read-SubnetMaskWithDefault -Prompt "  Masque de sous-réseau (CIDR /24 ou décimal 255.255.255.0)"
+    } else {
+        $prefix = ConvertTo-PrefixLength -InputValue $maskPart
+        if ($null -eq $prefix) {
+            Write-Host "  Masque invalide. Attendu : /24 ou 255.255.255.0" -ForegroundColor Yellow
+            Wait-EnterOrEscape
+            return
+        }
+    }
+
+    # 3. Passerelle.
+    $gateway = Read-HostWithEscape -Prompt "Passerelle (gateway, ex : 10.0.0.1)"
+    if ($null -eq $gateway) { return }
+    if ([string]::IsNullOrWhiteSpace($gateway) -or -not (Test-IPv4Address -InputValue $gateway)) {
+        Write-Host "  Passerelle invalide." -ForegroundColor Yellow
+        Wait-EnterOrEscape
+        return
+    }
+
+    # route.exe refuse une destination dont des bits hote depassent le masque : on la ramene
+    # a son adresse reseau avant de la passer (10.0.0.5/24 -> 10.0.0.0).
+    $ipBytes = ([System.Net.IPAddress]::Parse($ipPart)).GetAddressBytes()
+    $ipValue = ([int64]$ipBytes[0] -shl 24) -bor ([int64]$ipBytes[1] -shl 16) -bor ([int64]$ipBytes[2] -shl 8) -bor [int64]$ipBytes[3]
+    $maskValue = if ($prefix -eq 0) { [int64]0 } else { (0xFFFFFFFFL -shl (32 - $prefix)) -band 0xFFFFFFFFL }
+    $destNetwork = ConvertTo-DottedDecimal ($ipValue -band $maskValue)
+    $maskDotted = ConvertFrom-PrefixLength $prefix
+
+    $persist = Read-YesNo -Prompt "Rendre cette route persistante (survit au redémarrage) ?" -Default $false
+
+    $routeArgs = @()
+    if ($persist) { $routeArgs += '-p' }
+    $routeArgs += @('add', $destNetwork, 'mask', $maskDotted, $gateway)
+
+    Write-Host ""
+    Write-Host ("  route {0}" -f ($routeArgs -join ' ')) -ForegroundColor DarkGray
+    $output = & route.exe @routeArgs 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Route ajoutée." -ForegroundColor Green
+    } else {
+        Write-Host ("Erreur : {0}" -f (($output | Out-String).Trim())) -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+function Invoke-DeleteRoute {
+    Clear-Host
+    Write-Host "=== Supprimer une route ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # On n'expose que les routes ayant une passerelle explicite (NextHop != 0.0.0.0) :
+    # ce sont les routes ajoutees manuellement (comme via cet outil ou route add), les
+    # seules qu'on supprime en pratique. Les routes on-link auto-generees par Windows
+    # (sous-reseaux d'interface, broadcast, multicast, loopback) sont masquees pour eviter
+    # les suppressions accidentelles — et pour garder la liste courte et lisible.
+    # La route par defaut (0.0.0.0/0) est aussi exclue : la supprimer couperait toute
+    # connectivite sortante, ce n'est jamais l'intention derriere cet outil.
+    $routes = @(Get-Ipv4RouteList | Where-Object { $_.Gateway -ne '0.0.0.0' -and $_.Gateway -ne '::' -and $_.Destination -ne '0.0.0.0/0' })
+    if ($routes.Count -eq 0) {
+        Write-Host "Aucune route supprimable (routes avec passerelle explicite)." -ForegroundColor Yellow
+        Wait-EnterOrEscape
+        return
+    }
+
+    $items = @($routes | ForEach-Object {
+        "{0,-20} via {1,-15} [{2}]  métrique {3}  persist:{4}" -f $_.Destination, $_.Gateway, $_.Interface, $_.Metric, $_.Persistante
+    })
+    $items += "<< Annuler"
+    $choice = Show-ArrowMenu -Title "Sélectionnez une route à supprimer :" -Items $items -DefaultIndex 0
+    if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+    $target = $routes[$choice]
+
+    Write-Host ""
+    if (-not (Read-YesNo -Prompt "Supprimer la route $($target.Destination) via $($target.Gateway) ?" -Default $false)) {
+        return
+    }
+
+    $parts = $target.Destination -split '/'
+    $maskDotted = ConvertFrom-PrefixLength ([int]$parts[1])
+    $output = & route.exe delete $parts[0] mask $maskDotted $target.Gateway 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Route supprimée." -ForegroundColor Green
+    } else {
+        Write-Host ("Erreur : {0}" -f (($output | Out-String).Trim())) -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+function Invoke-RouteManager {
+    while ($true) {
+        Clear-Host
+        Write-Host "=== Table de routage ===" -ForegroundColor Cyan
+        Write-Host ""
+        $actionItems = @('Afficher les routes', 'Ajouter une route', 'Supprimer une route', '<< Retour au menu principal')
+        $choice = Show-ArrowMenu -Title "Action :" -Items $actionItems -DefaultIndex 0
+        if ($choice -lt 0 -or $choice -eq $actionItems.Count - 1) { return }
+        switch ($choice) {
+            0 { Show-RouteTable }
+            1 { Invoke-AddRoute }
+            2 { Invoke-DeleteRoute }
+        }
+    }
+}
+
+#endregion
 
 function Invoke-DnsLeakTest {
     Clear-Host
@@ -1998,6 +2308,7 @@ function Start-MainLoop {
         [PSCustomObject]@{ Type = 'Item'; Label = 'Presets'; Action = 'Presets' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'DHCP : Release / Renew'; Action = 'Dhcp' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Profil réseau (Public / Privé)'; Action = 'Profile' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Table de routage (afficher / ajouter / supprimer)'; Action = 'Routes' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Outils de diagnostic ===' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Connectivité                   >'; Action = 'SubConnectivity' }
@@ -2029,6 +2340,8 @@ function Start-MainLoop {
             [PSCustomObject]@{ Label = 'Table ARP (voisins réseau)'; Action = 'Arp' }
             [PSCustomObject]@{ Label = 'Réseaux Wi-Fi à proximité'; Action = 'Wifi' }
             [PSCustomObject]@{ Label = 'Wake-on-LAN'; Action = 'Wol' }
+            [PSCustomObject]@{ Label = 'Calculateur de sous-réseau'; Action = 'SubnetCalc' }
+            [PSCustomObject]@{ Label = "Convertisseur d'adresses IP"; Action = 'IpConvert' }
         ) }
         SubStatus = @{ Title = 'État & trafic'; Entries = @(
             [PSCustomObject]@{ Label = 'État des interfaces'; Action = 'ConfigExport' }
@@ -2084,6 +2397,7 @@ function Invoke-ToolAction {
         'Presets'         { Show-PresetsMenu }
         'Dhcp'            { Invoke-DhcpReleaseRenew }
         'Profile'         { Invoke-NetworkProfileManager }
+        'Routes'          { Invoke-RouteManager }
         'Diagnostic'      { Invoke-NetworkDiagnostic }
         'Ping'            { Invoke-PingHost }
         'Tracert'         { Invoke-TracertHost }
@@ -2095,6 +2409,8 @@ function Invoke-ToolAction {
         'Arp'             { Invoke-ArpTable }
         'Wifi'            { Invoke-WifiScan }
         'Wol'             { Invoke-WakeOnLan }
+        'SubnetCalc'      { Invoke-SubnetCalculator }
+        'IpConvert'       { Invoke-IpConverter }
         'ConfigExport'    { Invoke-ConfigExport }
         'Stats'           { Invoke-InterfaceStatistics }
         'Connections'     { Invoke-ActiveConnections }
