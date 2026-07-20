@@ -8,6 +8,9 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+# Version affichee sur l'ecran d'accueil. A garder synchronisee avec MyAppVersion dans Setup.iss.
+$script:AppVersion = '1.3.0'
+
 # Force l'UTF-8 en sortie pour que les caractères accentués s'affichent correctement,
 # quel que soit l'hôte (Windows Terminal, conhost, ISE...).
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -28,6 +31,8 @@ function Show-Banner {
               G E S T I O N N A I R E   D ' I N T E R F A C E S   R É S E A U
 "@
     Write-Host $banner -ForegroundColor Cyan
+    # Version alignee a droite sous le bandeau (largeur ~ celle de l'art ASCII).
+    Write-Host ("{0,89}" -f "v$script:AppVersion") -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "  Bienvenue ! Ce script interactif permet de configurer les interfaces réseau de cette machine." -ForegroundColor Gray
     Write-Host "  Il fournit également des presets de configuration IP et des outils de diagnostic réseau." -ForegroundColor Gray
@@ -64,6 +69,35 @@ function Read-HostWithEscape {
                 if (-not [char]::IsControl($key.KeyChar)) {
                     [void]$sb.Append($key.KeyChar)
                     [Console]::Write($key.KeyChar)
+                }
+            }
+        }
+    }
+}
+
+# Comme Read-HostWithEscape, mais masque la saisie par des '*' (mots de passe). Retourne
+# $null si Échap, sinon la chaîne saisie (eventuellement vide). Le texte saisi n'est jamais
+# reaffiche ni journalise.
+function Read-SecretWithEscape {
+    param([string]$Prompt)
+    [Console]::CursorVisible = $true
+    Write-Host -NoNewline "$Prompt : "
+    $sb = [System.Text.StringBuilder]::new()
+    while ($true) {
+        $key = [Console]::ReadKey($true)
+        switch ($key.Key) {
+            'Escape' { Write-Host ""; return $null }
+            'Enter'  { Write-Host ""; return $sb.ToString() }
+            'Backspace' {
+                if ($sb.Length -gt 0) {
+                    $sb.Length -= 1
+                    [Console]::Write("`b `b")
+                }
+            }
+            default {
+                if (-not [char]::IsControl($key.KeyChar)) {
+                    [void]$sb.Append($key.KeyChar)
+                    [Console]::Write('*')
                 }
             }
         }
@@ -247,8 +281,28 @@ function Show-ArrowMenu {
         [int]$DefaultIndex = 0,
         [switch]$TitleAtBottom
     )
-    $selected = [Math]::Max(0, [Math]::Min($DefaultIndex, $Items.Count - 1))
+    $count = $Items.Count
+    $selected = [Math]::Max(0, [Math]::Min($DefaultIndex, $count - 1))
     $width = [Math]::Max(40, [Console]::WindowWidth - 2)
+
+    # Fenetre de defilement : on ne dessine qu'un sous-ensemble tenant a l'ecran. On se limite au
+    # PLUS PETIT de la fenetre et du buffer (dans certains hotes — terminal VS Code — le buffer est
+    # aussi court que la fenetre), sinon SetCursorPosition sort du buffer sur les longues listes.
+    $screenH = [Math]::Min([Console]::WindowHeight, [Console]::BufferHeight)
+    $maxVisible = [Math]::Max(5, $screenH - 4)
+    $scroll = $count -gt $maxVisible
+    if ($scroll) {
+        # 1 ligne d'indicateur en haut (masques au-dessus) + 1 en bas (masques en dessous).
+        $headerRows = 1; $footerRows = 1; $itemRows = $maxVisible - 2
+    } else {
+        $headerRows = 0; $footerRows = 0; $itemRows = $count
+    }
+    $blockHeight = $headerRows + $itemRows + $footerRows
+
+    # Offset = index du premier item visible. Cale pour que la selection initiale apparaisse.
+    $offset = 0
+    $maxOffset = [Math]::Max(0, $count - $itemRows)
+    if ($scroll -and $selected -ge $itemRows) { $offset = [Math]::Min($selected - $itemRows + 1, $maxOffset) }
 
     Write-Host ""
     if ($Title -and -not $TitleAtBottom) { Write-Host $Title -ForegroundColor DarkGray }
@@ -257,7 +311,7 @@ function Show-ArrowMenu {
     # Couleur de repos de chaque ligne, precalculee une seule fois (en-tetes === en DarkCyan).
     $baseColors = @($Items | ForEach-Object { if ($_ -match '^===') { 'DarkCyan' } else { 'Gray' } })
 
-    $writeLine = {
+    $writeItem = {
         param($i, [bool]$InPlace)
         $marker = if ($i -eq $selected) { ">" } else { " " }
         $line = " $marker $($Items[$i])"
@@ -268,43 +322,88 @@ function Show-ArrowMenu {
         Write-Host $line -NoNewline:$InPlace @colors
     }
 
+    # Ligne d'indicateur (haut/bas) : texte gris, remplie a $width pour effacer l'ancien contenu.
+    $writeIndicator = {
+        param([string]$Text, [bool]$InPlace)
+        $line = $Text
+        if ($line.Length -gt $width) { $line = $line.Substring(0, $width) }
+        Write-Host $line.PadRight($width) -NoNewline:$InPlace -ForegroundColor DarkGray
+    }
+
+    # Redessine tout le bloc visible (indicateurs + items) a partir de $top. Utilise apres un
+    # changement d'offset (defilement) : les deux lignes concernees ne suffisent plus.
+    $drawBlock = {
+        if ($headerRows -gt 0) {
+            [Console]::SetCursorPosition(0, $top)
+            & $writeIndicator ("   ↑ $offset de plus…") $true
+        }
+        for ($r = 0; $r -lt $itemRows; $r++) {
+            [Console]::SetCursorPosition(0, $top + $headerRows + $r)
+            $i = $offset + $r
+            if ($i -lt $count) { & $writeItem $i $true } else { & $writeIndicator '' $true }
+        }
+        if ($footerRows -gt 0) {
+            $below = [Math]::Max(0, $count - ($offset + $itemRows))
+            [Console]::SetCursorPosition(0, $top + $headerRows + $itemRows)
+            & $writeIndicator ("   ↓ $below de plus…") $true
+        }
+    }
+
     $top = 0
     $extraLines = 0
     try {
-        # Premier dessin complet, avec sauts de ligne pour laisser le defilement naturel se
-        # produire, puis calcul de la position du haut du menu a partir de la position finale
-        # du curseur : reste juste meme si l'affichage a fait defiler la fenetre.
-        for ($i = 0; $i -lt $Items.Count; $i++) { & $writeLine $i $false }
+        # Premier dessin, avec sauts de ligne pour laisser le defilement naturel se produire,
+        # puis calcul du haut du bloc a partir de la position finale du curseur.
+        if ($headerRows -gt 0) { & $writeIndicator ("   ↑ $offset de plus…") $false }
+        for ($r = 0; $r -lt $itemRows; $r++) {
+            $i = $offset + $r
+            if ($i -lt $count) { & $writeItem $i $false } else { Write-Host "" }
+        }
+        if ($footerRows -gt 0) {
+            $below = [Math]::Max(0, $count - ($offset + $itemRows))
+            & $writeIndicator ("   ↓ $below de plus…") $false
+        }
         if ($TitleAtBottom -and $Title) {
             Write-Host ""
             Write-Host $Title -ForegroundColor DarkGray
             $extraLines = 2
         }
-        # Clamp a 0 : si la liste est plus haute que le buffer console, l'affichage a defile
-        # et CursorTop est plafonne au bas du buffer, ce qui rendrait $top negatif — puis
-        # ferait planter SetCursorPosition. On evite le crash au prix d'un rendu imparfait
-        # pour les listes geantes (rares : la plupart des menus tiennent a l'ecran).
-        $top = [Math]::Max(0, [Console]::CursorTop - $Items.Count - $extraLines)
+        # Clamp a 0 : si malgre la fenetre le bloc a fait defiler jusqu'en bas du buffer,
+        # CursorTop est plafonne et $top deviendrait negatif.
+        $top = [Math]::Max(0, [Console]::CursorTop - $blockHeight - $extraLines)
 
         while ($true) {
             # Curseur gare a un endroit fixe pour eviter tout "saut" visuel entre les frappes.
             [Console]::SetCursorPosition(0, $top)
             $key = [Console]::ReadKey($true)
             $previous = $selected
+            $prevOffset = $offset
             switch ($key.Key) {
-                'UpArrow'    { $selected = ($selected - 1 + $Items.Count) % $Items.Count }
-                'DownArrow'  { $selected = ($selected + 1) % $Items.Count }
+                'UpArrow'    { $selected = ($selected - 1 + $count) % $count }
+                'DownArrow'  { $selected = ($selected + 1) % $count }
+                'PageUp'     { $selected = [Math]::Max(0, $selected - $itemRows) }
+                'PageDown'   { $selected = [Math]::Min($count - 1, $selected + $itemRows) }
+                'Home'       { $selected = 0 }
+                'End'        { $selected = $count - 1 }
                 'Enter'      { return $selected }
                 'Spacebar'   { return $selected }
                 'Escape'     { return -1 }
             }
-            if ($selected -ne $previous) {
-                # Ne redessine que les deux lignes concernees (ancienne et nouvelle selection)
-                # au lieu de la liste entiere : la navigation reste fluide sur les grands menus.
-                [Console]::SetCursorPosition(0, $top + $previous)
-                & $writeLine $previous $true
-                [Console]::SetCursorPosition(0, $top + $selected)
-                & $writeLine $selected $true
+            # Recale la fenetre pour garder la selection visible.
+            if ($scroll) {
+                if ($selected -lt $offset) { $offset = $selected }
+                elseif ($selected -ge $offset + $itemRows) { $offset = $selected - $itemRows + 1 }
+                $offset = [Math]::Min([Math]::Max(0, $offset), $maxOffset)
+            }
+            if ($offset -ne $prevOffset) {
+                # Defilement : le contenu de la fenetre change, on redessine tout le bloc.
+                & $drawBlock
+            } elseif ($selected -ne $previous) {
+                # Meme fenetre : ne redessine que l'ancienne et la nouvelle ligne selectionnee.
+                [Console]::SetCursorPosition(0, $top + $headerRows + ($previous - $offset))
+                & $writeItem $previous $true
+                [Console]::SetCursorPosition(0, $top + $headerRows + ($selected - $offset))
+                & $writeItem $selected $true
             }
         }
     } finally {
@@ -313,9 +412,9 @@ function Show-ArrowMenu {
         # que l'ecran suivant ne soit dessine. Ce sont les fonctions de saisie
         # (Read-WithDefault, Read-YesNo, Read-HostWithEscape) qui le reactivent elles-memes.
         [Console]::CursorVisible = $false
-        # Replace le curseur SOUS le menu : le laisser gare en haut faisait ecrire la suite
+        # Replace le curseur SOUS le bloc : le laisser gare en haut faisait ecrire la suite
         # de l'affichage par-dessus les lignes du menu (surimpressions constatees).
-        [Console]::SetCursorPosition(0, $top + $Items.Count + $extraLines)
+        [Console]::SetCursorPosition(0, $top + $blockHeight + $extraLines)
         Write-Host ""
     }
 }
@@ -1778,6 +1877,510 @@ function Invoke-RouteManager {
 
 #endregion
 
+#region Partages réseau (net use)
+
+# Liste structuree des partages connectes. Deux sources fusionnees :
+#  1. Get-SmbMapping : mappages VIVANTS de la session courante (celle du processus). Sous
+#     UAC, un processus eleve (ce script l'est) forme une session de logon distincte de la
+#     session interactive : il ne voit donc PAS les lecteurs mappes par l'Explorateur non
+#     eleve, et inversement. C'est la cause du "je ne vois que ceux ajoutes via net use".
+#  2. HKCU:\Network : mappages PERSISTANTS ("reconnexion a l'ouverture de session"), stockes
+#     par utilisateur donc lisibles quel que soit le jeton. C'est la que l'Explorateur
+#     enregistre ses lecteurs coches "se reconnecter" — on les recupere ainsi malgre l'UAC.
+# Limite residuelle : un mappage Explorateur NON persistant reste invisible depuis le
+# processus eleve (rien en session, rien au registre) — Windows ne l'expose pas sans
+# EnableLinkedConnections.
+function Get-ShareMappingList {
+    # Mappages persistants du registre, indexes par lettre (ex "Z:").
+    $persistent = @{}
+    if (Test-Path 'HKCU:\Network') {
+        foreach ($sub in @(Get-ChildItem 'HKCU:\Network' -ErrorAction SilentlyContinue)) {
+            $remote = (Get-ItemProperty -Path $sub.PSPath -ErrorAction SilentlyContinue).RemotePath
+            if ($remote) { $persistent[($sub.PSChildName.ToUpperInvariant() + ':')] = $remote }
+        }
+    }
+
+    $list = [System.Collections.Generic.List[object]]::new()
+    $seen = @{}
+    foreach ($m in @(Get-SmbMapping -ErrorAction SilentlyContinue)) {
+        $letterKey = if ($m.LocalPath) { $m.LocalPath.ToUpperInvariant() } else { '' }
+        $list.Add([PSCustomObject]@{
+            Lecteur    = if ($m.LocalPath) { $m.LocalPath } else { '(sans lettre)' }
+            Chemin     = $m.RemotePath
+            Statut     = "$($m.Status)"
+            Persistant = if ($letterKey -and $persistent.ContainsKey($letterKey)) { 'Oui' } else { 'Non' }
+        })
+        if ($letterKey) { $seen[$letterKey] = $true }
+    }
+
+    # Persistants absents de la session courante : typiquement les lecteurs mappes par
+    # l'Explorateur (jeton non eleve), montes ailleurs mais pas dans ce processus.
+    foreach ($kv in $persistent.GetEnumerator()) {
+        if (-not $seen.ContainsKey($kv.Key)) {
+            $list.Add([PSCustomObject]@{
+                Lecteur    = $kv.Key
+                Chemin     = $kv.Value
+                Statut     = 'Non monté dans cette session'
+                Persistant = 'Oui'
+            })
+        }
+    }
+
+    @($list | Sort-Object Lecteur)
+}
+
+# Enumere les partages exposes par un serveur via l'API NetShareEnum (netapi32) niveau 1.
+# Choix de cette API plutot que le parsing de "net view" : resultat structure et INDEPENDANT
+# de la langue de Windows, et compatible SMB pur (NAS, Samba) contrairement a WMI/CIM.
+# L'enumeration s'appuie sur la session d'authentification courante vers le serveur : il faut
+# donc avoir etabli une connexion (ex IPC$) avec les bons identifiants au prealable.
+function Get-RemoteShareList {
+    param([string]$Server)
+
+    if (-not ('NetApi32.ShareEnum' -as [type])) {
+        Add-Type -Namespace NetApi32 -Name ShareEnum -MemberDefinition @'
+[DllImport("netapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+public static extern int NetShareEnum(string servername, int level, out System.IntPtr bufptr, int prefmaxlen, out int entriesread, out int totalentries, ref int resume_handle);
+[DllImport("netapi32.dll")]
+public static extern int NetApiBufferFree(System.IntPtr Buffer);
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+public struct SHARE_INFO_1 {
+    public string netname;
+    public uint shtype;
+    public string remark;
+}
+public static int StructSize() { return System.Runtime.InteropServices.Marshal.SizeOf(typeof(SHARE_INFO_1)); }
+'@
+    }
+
+    $buffer = [IntPtr]::Zero
+    $read = 0; $total = 0; $resume = 0
+    # prefmaxlen = -1 (MAX_PREFERRED_LENGTH) : laisse l'API dimensionner le tampon.
+    $rc = [NetApi32.ShareEnum]::NetShareEnum($Server, 1, [ref]$buffer, -1, [ref]$read, [ref]$total, [ref]$resume)
+    if ($rc -ne 0) { throw "NetShareEnum a échoué (code $rc)." }
+
+    $shares = [System.Collections.Generic.List[object]]::new()
+    try {
+        # Taille calculee cote C# (Marshal.SizeOf sur un objet Type PowerShell est ambigu et
+        # echoue). PtrToStructure en forme generique pour eviter la surcharge obsolete.
+        $size = [NetApi32.ShareEnum]::StructSize()
+        $ptr = $buffer
+        for ($i = 0; $i -lt $read; $i++) {
+            $si = [System.Runtime.InteropServices.Marshal]::PtrToStructure[NetApi32.ShareEnum+SHARE_INFO_1]($ptr)
+            # Octet de poids faible = type de base (0 = disque, 1 = imprimante, 3 = IPC).
+            # Bit 0x80000000 = partage special/administratif ($ : C$, ADMIN$, IPC$...).
+            $base = $si.shtype -band 0xFF
+            if ($base -eq 0) {
+                $shares.Add([PSCustomObject]@{
+                    Nom       = $si.netname
+                    Remarque  = $si.remark
+                    Special   = (($si.shtype -band [uint32]2147483648) -ne 0)
+                })
+            }
+            $ptr = [IntPtr]($ptr.ToInt64() + $size)
+        }
+    } finally {
+        [NetApi32.ShareEnum]::NetApiBufferFree($buffer) | Out-Null
+    }
+    # Partages "normaux" d'abord, puis administratifs, chacun trie par nom.
+    @($shares | Sort-Object @{Expression = 'Special'}, @{Expression = 'Nom'})
+}
+
+function Show-ShareMappings {
+    Clear-Host
+    Write-Host "=== Partages réseau connectés (équivalent net use) ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Sans EnableLinkedConnections, un processus eleve (celui-ci) ne voit pas les lecteurs
+    # non persistants mappes par l'Explorateur non eleve : la liste peut donc etre incomplete.
+    if ((Get-EnableLinkedConnections) -ne 1) {
+        Write-Host "  ⚠ EnableLinkedConnections est désactivé : certains lecteurs mappés via" -ForegroundColor Yellow
+        Write-Host "    l'Explorateur peuvent ne pas apparaître ci-dessous." -ForegroundColor Yellow
+        Write-Host "    Menu principal > Options > Partages réseau pour l'activer." -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    $maps = @(Get-ShareMappingList)
+    if ($maps.Count -eq 0) {
+        Write-Host "Aucun partage réseau connecté." -ForegroundColor Yellow
+    } else {
+        $maps | Format-Table Lecteur, Chemin, Statut, Persistant -AutoSize | Out-String | Write-Host
+    }
+    Wait-EnterOrEscape
+}
+
+# Aide au choix du partage : etablit au besoin une session authentifiee vers le serveur,
+# enumere ses partages et propose une liste. Retour : $null = annuler, '' = saisie manuelle
+# (enumeration impossible ou choisie), sinon le nom du partage selectionne.
+function Select-RemoteShare {
+    param(
+        [string]$Server,
+        [string]$User,
+        [string]$Password
+    )
+
+    # NetShareEnum s'appuie sur la session d'authentification courante vers le serveur. Si des
+    # identifiants explicites sont fournis et qu'aucune connexion vers ce serveur n'existe encore,
+    # on ouvre une connexion IPC$ temporaire pour authentifier l'enumeration. Si une connexion
+    # existe deja, on la reutilise (et on n'y touche pas).
+    $tempIpc = $false
+    $hasConn = @(Get-SmbMapping -ErrorAction SilentlyContinue | Where-Object { $_.RemotePath -like "\\$Server\*" }).Count -gt 0
+    if (-not $hasConn -and -not [string]::IsNullOrWhiteSpace($User)) {
+        $ipcArgs = @('use', "\\$Server\IPC$")
+        if (-not [string]::IsNullOrWhiteSpace($Password)) { $ipcArgs += $Password }
+        $ipcArgs += "/user:$User"
+        $ipcArgs += '/persistent:no'
+        & net.exe @ipcArgs 2>&1 | Out-Null
+        if ($LASTEXITCODE -eq 0) { $tempIpc = $true }
+    }
+
+    $shares = $null
+    try { $shares = @(Get-RemoteShareList -Server $Server) } catch { $shares = $null }
+
+    if ($null -eq $shares -or $shares.Count -eq 0) {
+        # Enumeration impossible : on retire l'IPC$ temporaire et on bascule en saisie manuelle.
+        if ($tempIpc) { & net.exe use "\\$Server\IPC$" /delete /y 2>&1 | Out-Null }
+        Write-Host "  Impossible d'énumérer les partages ; saisie manuelle du nom." -ForegroundColor DarkGray
+        Write-Host ""
+        return ''
+    }
+
+    $items = @($shares | ForEach-Object {
+        $label = $_.Nom
+        if ($_.Remarque) { $label += "  —  $($_.Remarque)" }
+        if ($_.Special)  { $label += "  (administratif)" }
+        $label
+    })
+    $items += "Saisir un nom manuellement"
+    $items += "<< Annuler"
+    $choice = Show-ArrowMenu -Title "Partages disponibles sur \\$Server :" -Items $items -DefaultIndex 0
+
+    if ($choice -lt 0 -or $choice -eq $items.Count - 1) {
+        # Annulation : on ne laisse pas trainer la connexion IPC$ ouverte pour l'occasion.
+        if ($tempIpc) { & net.exe use "\\$Server\IPC$" /delete /y 2>&1 | Out-Null }
+        return $null
+    }
+    if ($choice -eq $items.Count - 2) { return '' }   # saisie manuelle demandee
+    return $shares[$choice].Nom
+}
+
+function Invoke-AddShare {
+    Clear-Host
+    Write-Host "=== Connecter un partage réseau (net use) ===" -ForegroundColor Cyan
+    Write-Host "  Échap pour annuler à toute étape." -ForegroundColor DarkGray
+    Write-Host ""
+
+    # 1. Serveur cible. TrimStart('\') tolere une saisie deja prefixee de \\.
+    $server = Read-HostWithEscape -Prompt "Serveur à connecter (IP ou domaine, ex : 192.168.1.10 ou serveur.local)"
+    if ($null -eq $server -or [string]::IsNullOrWhiteSpace($server)) { return }
+    $server = $server.Trim().TrimStart('\')
+
+    # 2. Identifiants demandes AVANT le partage : ils servent a authentifier l'enumeration des
+    #    partages du serveur. Entree utilisateur = identifiants de la session courante.
+    $user = Read-HostWithEscape -Prompt "Nom d'utilisateur (Entrée = session courante ; format domaine\utilisateur accepté)"
+    if ($null -eq $user) { return }
+    $user = $user.Trim()
+
+    # Mot de passe masque, demande seulement si un utilisateur explicite est fourni.
+    # Laisse vide : Windows demandera lui-meme le mot de passe (invite masquee de net use).
+    $password = ''
+    if (-not [string]::IsNullOrWhiteSpace($user)) {
+        $password = Read-SecretWithEscape -Prompt "Mot de passe (Entrée = laisser Windows le demander)"
+        if ($null -eq $password) { return }
+    }
+
+    # 3. Partage : on tente de lister les partages exposes par le serveur pour choisir dans une
+    #    liste. Repli sur saisie manuelle si l'enumeration echoue (acces refuse, pare-feu...).
+    #    Select-RemoteShare renvoie : $null = annuler, '' = saisie manuelle, sinon le nom choisi.
+    Write-Host ""
+    $share = Select-RemoteShare -Server $server -User $user -Password $password
+    if ($null -eq $share) { return }
+    if ([string]::IsNullOrWhiteSpace($share)) {
+        $share = Read-HostWithEscape -Prompt "Nom du partage (ex : Public)"
+        if ($null -eq $share) { return }
+        $share = $share.Trim().Trim('\')
+        if ([string]::IsNullOrWhiteSpace($share)) {
+            Write-Host "  Nom de partage requis." -ForegroundColor Yellow
+            Wait-EnterOrEscape
+            return
+        }
+    }
+    $unc = "\\$server\$share"
+
+    # 4. Lettre de lecteur : refuse une lettre deja prise (DriveInfo couvre disques locaux,
+    # amovibles et lecteurs reseau deja mappes). Entree seule = connexion sans lettre
+    # (deviceless) : utile pour s'authentifier aupres d'un serveur sans mobiliser de lettre.
+    $usedLetters = @([System.IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1).ToUpperInvariant() })
+    $drive = $null
+    while ($true) {
+        $letter = Read-HostWithEscape -Prompt "Lettre de lecteur (Entrée = aucune / connexion sans lettre, ex : Z)"
+        if ($null -eq $letter) { return }
+        $letter = $letter.Trim().TrimEnd(':')
+        if ([string]::IsNullOrWhiteSpace($letter)) { $drive = $null; break }
+        $letter = $letter.ToUpperInvariant()
+        if ($letter -notmatch '^[A-Z]$') {
+            Write-Host "  Lettre invalide (une seule lettre A-Z)." -ForegroundColor Yellow
+            continue
+        }
+        if ($usedLetters -contains $letter) {
+            Write-Host "  La lettre $letter`: est déjà utilisée. Choisissez-en une autre." -ForegroundColor Yellow
+            continue
+        }
+        $drive = "$letter`:"
+        break
+    }
+
+    # 5. Persistance (reconnexion automatique a l'ouverture de session).
+    $persist = Read-YesNo -Prompt "Rendre cette connexion persistante (reconnexion à l'ouverture de session) ?" -Default $false
+    $persistArg = if ($persist) { 'yes' } else { 'no' }
+
+    # Le mot de passe n'est jamais reaffiche : on n'echo pas la commande (contrairement aux
+    # routes ou la commande complete est montree pour transparence).
+    $useArgs = @('use')
+    if ($drive) { $useArgs += $drive }
+    $useArgs += $unc
+    if (-not [string]::IsNullOrWhiteSpace($password)) { $useArgs += $password }
+    if (-not [string]::IsNullOrWhiteSpace($user)) { $useArgs += "/user:$user" }
+    $useArgs += "/persistent:$persistArg"
+
+    Write-Host ""
+    $output = & net.exe @useArgs 2>&1
+
+    # Erreur 1219 : Windows interdit plusieurs connexions au meme serveur avec des identifiants
+    # differents (limite par session d'ouverture). On liste les connexions existantes vers ce
+    # serveur et on propose de les fermer avant de reessayer automatiquement.
+    if ($LASTEXITCODE -ne 0 -and (($output | Out-String) -match '\b1219\b')) {
+        Write-Host "Windows refuse plusieurs connexions au même serveur avec des identifiants" -ForegroundColor Yellow
+        Write-Host "différents (erreur 1219). Une connexion vers $server existe déjà." -ForegroundColor Yellow
+        Write-Host ""
+
+        $existing = @(
+            Get-SmbMapping -ErrorAction SilentlyContinue |
+                Where-Object { $_.RemotePath -like "\\$server\*" -or $_.RemotePath -ieq "\\$server" }
+        )
+        if ($existing.Count -gt 0) {
+            Write-Host "Connexions existantes vers ce serveur :" -ForegroundColor DarkGray
+            foreach ($m in $existing) {
+                $loc = if ([string]::IsNullOrWhiteSpace($m.LocalPath)) { '(sans lettre)' } else { $m.LocalPath }
+                Write-Host ("  {0,-12} {1}" -f $loc, $m.RemotePath) -ForegroundColor DarkGray
+            }
+            Write-Host ""
+        } else {
+            Write-Host "Aucune connexion détectée automatiquement (peut-être dans une autre" -ForegroundColor DarkGray
+            Write-Host "session ou une connexion IPC$ masquée). 'net use' listera tout." -ForegroundColor DarkGray
+            Write-Host ""
+        }
+
+        if (Read-YesNo -Prompt "Déconnecter la/les connexion(s) existante(s) vers $server et réessayer ?" -Default $true) {
+            foreach ($m in $existing) {
+                $spec = if ([string]::IsNullOrWhiteSpace($m.LocalPath)) { $m.RemotePath } else { $m.LocalPath }
+                & net.exe use $spec /delete /y 2>&1 | Out-Null
+            }
+            Write-Host ""
+            $output = & net.exe @useArgs 2>&1
+        }
+    }
+
+    if ($LASTEXITCODE -eq 0) {
+        if ($drive) {
+            Write-Host "Partage connecté sur $drive ($unc)." -ForegroundColor Green
+        } else {
+            Write-Host "Connexion établie à $unc (sans lettre de lecteur)." -ForegroundColor Green
+        }
+    } else {
+        Write-Host ("Erreur : {0}" -f (($output | Out-String).Trim())) -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+function Invoke-RemoveShare {
+    Clear-Host
+    Write-Host "=== Déconnecter un partage réseau ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    $maps = @(Get-ShareMappingList)
+    if ($maps.Count -eq 0) {
+        Write-Host "Aucun partage réseau connecté." -ForegroundColor Yellow
+        Wait-EnterOrEscape
+        return
+    }
+
+    $items = @($maps | ForEach-Object { "{0,-12} {1,-42} [{2}]" -f $_.Lecteur, $_.Chemin, $_.Statut })
+    $items += "<< Annuler"
+    $choice = Show-ArrowMenu -Title "Sélectionnez un partage à déconnecter :" -Items $items -DefaultIndex 0
+    if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+    $target = $maps[$choice]
+
+    # Cible : la lettre de lecteur si presente, sinon le chemin UNC (connexion sans lettre).
+    $spec = if ($target.Lecteur -match '^[A-Za-z]:') { $target.Lecteur } else { $target.Chemin }
+
+    Write-Host ""
+    if (-not (Read-YesNo -Prompt "Déconnecter $spec ?" -Default $false)) { return }
+    # /y (force) : net use ferme les fichiers/connexions ouverts sans demander confirmation
+    # (sinon il refuse la deconnexion s'il detecte une ressource en cours d'utilisation).
+    $force = Read-YesNo -Prompt "Forcer (fermer les fichiers/connexions ouverts sans avertir) ?" -Default $false
+
+    $useArgs = @('use', $spec, '/delete')
+    if ($force) { $useArgs += '/y' }
+    $output = & net.exe @useArgs 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Partage déconnecté." -ForegroundColor Green
+    } else {
+        Write-Host ("Erreur : {0}" -f (($output | Out-String).Trim())) -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+function Invoke-ReconnectShare {
+    Clear-Host
+    Write-Host "=== Reconnecter un partage indisponible ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    # Cibles : tout ce qui n'est pas deja "OK" (deconnecte, indisponible, ou persistant non
+    # monte dans cette session — cas des lecteurs Explorateur repris depuis le registre).
+    $maps = @(Get-ShareMappingList | Where-Object { $_.Statut -ne 'OK' })
+    if ($maps.Count -eq 0) {
+        Write-Host "Aucun partage indisponible à reconnecter." -ForegroundColor Yellow
+        Wait-EnterOrEscape
+        return
+    }
+
+    $items = @($maps | ForEach-Object { "{0,-12} {1,-42} [{2}]" -f $_.Lecteur, $_.Chemin, $_.Statut })
+    $items += "<< Annuler"
+    $choice = Show-ArrowMenu -Title "Sélectionnez un partage à reconnecter :" -Items $items -DefaultIndex 0
+    if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+    $target = $maps[$choice]
+
+    # Recree la connexion a partir du chemin memorise. Si des identifiants sont necessaires,
+    # net use les demandera lui-meme (invite masquee).
+    if ($target.Lecteur -match '^[A-Za-z]:') {
+        $useArgs = @('use', $target.Lecteur, $target.Chemin)
+    } else {
+        $useArgs = @('use', $target.Chemin)
+    }
+
+    Write-Host ""
+    $output = & net.exe @useArgs 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Partage reconnecté ($($target.Chemin))." -ForegroundColor Green
+    } else {
+        Write-Host ("Erreur : {0}" -f (($output | Out-String).Trim())) -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+function Invoke-RemoveAllShares {
+    Clear-Host
+    Write-Host "=== Déconnecter TOUS les partages réseau ===" -ForegroundColor Cyan
+    Write-Host ""
+
+    $maps = @(Get-ShareMappingList)
+    if ($maps.Count -eq 0) {
+        Write-Host "Aucun partage réseau connecté." -ForegroundColor Yellow
+        Wait-EnterOrEscape
+        return
+    }
+
+    $maps | Format-Table Lecteur, Chemin, Statut -AutoSize | Out-String | Write-Host
+    if (-not (Read-YesNo -Prompt "Déconnecter les $($maps.Count) partage(s) ci-dessus ?" -Default $false)) { return }
+
+    # /y indispensable ici : "net use * /delete" demande sinon une confirmation interactive
+    # qui bloquerait le script. Il ferme aussi les fichiers/connexions ouverts sans avertir.
+    $output = & net.exe use * /delete /y 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "`nTous les partages ont été déconnectés." -ForegroundColor Green
+    } else {
+        Write-Host ("`nErreur : {0}" -f (($output | Out-String).Trim())) -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+function Invoke-ShareManager {
+    while ($true) {
+        Clear-Host
+        Write-Host "=== Partages réseau (net use) ===" -ForegroundColor Cyan
+        Write-Host ""
+        $actionItems = @(
+            'Afficher les partages',
+            'Connecter un partage',
+            'Reconnecter un partage indisponible',
+            'Déconnecter un partage',
+            'Déconnecter TOUS les partages',
+            '<< Retour au menu principal'
+        )
+        $choice = Show-ArrowMenu -Title "Action :" -Items $actionItems -DefaultIndex 0
+        if ($choice -lt 0 -or $choice -eq $actionItems.Count - 1) { return }
+        switch ($choice) {
+            0 { Show-ShareMappings }
+            1 { Invoke-AddShare }
+            2 { Invoke-ReconnectShare }
+            3 { Invoke-RemoveShare }
+            4 { Invoke-RemoveAllShares }
+        }
+    }
+}
+
+# HKLM (necessite l'elevation, dont on dispose deja) : DWORD relie les jetons eleve et non
+# eleve d'un meme utilisateur pour que leurs lecteurs mappes soient mutuellement visibles.
+$script:LinkedConnectionsKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+
+function Get-EnableLinkedConnections {
+    try {
+        return [int](Get-ItemProperty -Path $script:LinkedConnectionsKey -Name 'EnableLinkedConnections' -ErrorAction Stop).EnableLinkedConnections
+    } catch {
+        return 0
+    }
+}
+
+function Set-EnableLinkedConnections {
+    param([int]$Value)
+    New-ItemProperty -Path $script:LinkedConnectionsKey -Name 'EnableLinkedConnections' -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
+function Show-ShareOptionsMenu {
+    while ($true) {
+        $current = Get-EnableLinkedConnections
+        $state = if ($current -eq 1) { 'Activé' } else { 'Désactivé' }
+
+        Clear-Host
+        Write-Host "=== Options : Partages réseau ===" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host -NoNewline "  EnableLinkedConnections : "
+        Write-Host $state -ForegroundColor $(if ($current -eq 1) { 'Green' } else { 'Yellow' })
+        Write-Host ""
+        Write-Host "  Sous contrôle de compte d'utilisateur (UAC), un programme lancé en tant" -ForegroundColor DarkGray
+        Write-Host "  qu'administrateur s'exécute dans une session de logon distincte de votre" -ForegroundColor DarkGray
+        Write-Host "  session interactive. Les lecteurs réseau mappés dans l'Explorateur (non" -ForegroundColor DarkGray
+        Write-Host "  élevé) ne sont donc pas visibles des programmes élevés — et inversement." -ForegroundColor DarkGray
+        Write-Host "  C'est pourquoi cet outil, élevé, ne voit pas tous vos lecteurs mappés." -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  Activer ce réglage (DWORD EnableLinkedConnections = 1) relie les deux" -ForegroundColor DarkGray
+        Write-Host "  jetons : les lecteurs d'un côté deviennent visibles de l'autre." -ForegroundColor DarkGray
+        Write-Host "  Un REDÉMARRAGE est nécessaire pour que le changement prenne effet." -ForegroundColor Yellow
+        Write-Host ""
+
+        $toggleLabel = if ($current -eq 1) { 'Désactiver EnableLinkedConnections' } else { 'Activer EnableLinkedConnections' }
+        $items = @($toggleLabel, '<< Retour au menu principal')
+        $choice = Show-ArrowMenu -Title "Action :" -Items $items -DefaultIndex 0
+        if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+
+        $newValue = if ($current -eq 1) { 0 } else { 1 }
+        try {
+            Set-EnableLinkedConnections -Value $newValue
+            $verb = if ($newValue -eq 1) { 'activé' } else { 'désactivé' }
+            Write-Host ""
+            Write-Host "EnableLinkedConnections $verb." -ForegroundColor Green
+            Write-Host "Redémarrez la machine pour que le changement prenne effet." -ForegroundColor Yellow
+        } catch {
+            Write-Host ""
+            Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
+        }
+        Wait-EnterOrEscape
+    }
+}
+
+#endregion
+
 function Invoke-DnsLeakTest {
     Clear-Host
     Write-Host "=== Test de fuite DNS (dnsleak) ===" -ForegroundColor Cyan
@@ -2308,16 +2911,23 @@ function Start-MainLoop {
         [PSCustomObject]@{ Type = 'Item'; Label = 'Presets'; Action = 'Presets' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'DHCP : Release / Renew'; Action = 'Dhcp' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Profil réseau (Public / Privé)'; Action = 'Profile' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Table de routage (afficher / ajouter / supprimer)'; Action = 'Routes' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
-        [PSCustomObject]@{ Type = 'Header'; Label = '=== Outils de diagnostic ===' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Connectivité                   >'; Action = 'SubConnectivity' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'DNS                            >'; Action = 'SubDns' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Réseau local                   >'; Action = 'SubLan' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'État & trafic                  >'; Action = 'SubStatus' }
+        [PSCustomObject]@{ Type = 'Header'; Label = '=== Diagnostics ===' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Connectivité'; Action = 'SubConnectivity' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'DNS'; Action = 'SubDns' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Réseau local'; Action = 'SubLan' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'État & trafic'; Action = 'SubStatus' }
+        [PSCustomObject]@{ Type = 'Blank'; Label = '' }
+        [PSCustomObject]@{ Type = 'Header'; Label = '=== Outils ===' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Routage'; Action = 'Routes' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Partages réseau'; Action = 'Shares' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Calculateur de sous-réseau'; Action = 'SubnetCalc' }
+        [PSCustomObject]@{ Type = 'Item'; Label = "Convertisseur d'adresses IP"; Action = 'IpConvert' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Wake-on-LAN'; Action = 'Wol' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Options ===' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Masquer/afficher des interfaces'; Action = 'Options' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Partages réseau (EnableLinkedConnections)'; Action = 'ShareOptions' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '===' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Quitter'; Action = 'Quit' }
@@ -2339,9 +2949,6 @@ function Start-MainLoop {
             [PSCustomObject]@{ Label = 'Scan du sous-réseau'; Action = 'SubnetScan' }
             [PSCustomObject]@{ Label = 'Table ARP (voisins réseau)'; Action = 'Arp' }
             [PSCustomObject]@{ Label = 'Réseaux Wi-Fi à proximité'; Action = 'Wifi' }
-            [PSCustomObject]@{ Label = 'Wake-on-LAN'; Action = 'Wol' }
-            [PSCustomObject]@{ Label = 'Calculateur de sous-réseau'; Action = 'SubnetCalc' }
-            [PSCustomObject]@{ Label = "Convertisseur d'adresses IP"; Action = 'IpConvert' }
         ) }
         SubStatus = @{ Title = 'État & trafic'; Entries = @(
             [PSCustomObject]@{ Label = 'État des interfaces'; Action = 'ConfigExport' }
@@ -2398,6 +3005,7 @@ function Invoke-ToolAction {
         'Dhcp'            { Invoke-DhcpReleaseRenew }
         'Profile'         { Invoke-NetworkProfileManager }
         'Routes'          { Invoke-RouteManager }
+        'Shares'          { Invoke-ShareManager }
         'Diagnostic'      { Invoke-NetworkDiagnostic }
         'Ping'            { Invoke-PingHost }
         'Tracert'         { Invoke-TracertHost }
@@ -2416,6 +3024,7 @@ function Invoke-ToolAction {
         'Connections'     { Invoke-ActiveConnections }
         'PublicIp'        { Invoke-PublicIpLookup }
         'Options'         { Show-OptionsMenu }
+        'ShareOptions'    { Show-ShareOptionsMenu }
     }
 }
 
