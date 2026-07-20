@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Version affichee sur l'ecran d'accueil. A garder synchronisee avec MyAppVersion dans Setup.iss.
-$script:AppVersion = '1.3.0'
+$script:AppVersion = '1.3.1'
 
 # Force l'UTF-8 en sortie pour que les caractères accentués s'affichent correctement,
 # quel que soit l'hôte (Windows Terminal, conhost, ISE...).
@@ -114,6 +114,37 @@ function Read-WithDefault {
     $inputValue = Read-Host "$Prompt [$displayDefault]"
     if ([string]::IsNullOrWhiteSpace($inputValue)) { return $Default }
     return $inputValue
+}
+
+# Lit une metrique entiere (1-9999). Entree vide => $Default. Avec -AllowAuto, une
+# saisie vide (ou "auto") vaut $null, interprete comme "metrique automatique".
+function Read-MetricWithDefault {
+    param(
+        [string]$Prompt,
+        [Nullable[int]]$Default = $null,
+        [switch]$AllowAuto
+    )
+    [Console]::CursorVisible = $true
+    # Entree conserve toujours la valeur affichee entre crochets (coherent avec les autres
+    # prompts). Quand une metrique est deja definie, Entree la conserve donc : on ajoute
+    # "(ou 'auto')" pour signaler comment repasser en automatique. Quand le defaut est deja
+    # 'auto', Entree suffit a rester en auto.
+    if ($null -eq $Default) {
+        $displayDefault = if ($AllowAuto) { 'auto' } else { 'aucune' }
+        $hint = ''
+    } else {
+        $displayDefault = "$Default"
+        $hint = if ($AllowAuto) { " (ou 'auto')" } else { '' }
+    }
+    while ($true) {
+        $inputValue = Read-Host "$Prompt$hint [$displayDefault]"
+        if ([string]::IsNullOrWhiteSpace($inputValue)) { return $Default }
+        $t = $inputValue.Trim()
+        if ($AllowAuto -and $t -match '^(?i:auto)$') { return $null }
+        $n = 0
+        if ([int]::TryParse($t, [ref]$n) -and $n -ge 1 -and $n -le 9999) { return $n }
+        Write-Host "  Métrique invalide (entier entre 1 et 9999$(if ($AllowAuto) { " ou 'auto'" })). " -ForegroundColor Yellow
+    }
 }
 
 function Wait-EnterOrEscape {
@@ -472,6 +503,7 @@ function Get-NetworkInterfacesInfo {
             Gateway               = $gateway
             DnsServers            = $dnsList
             Dhcp                  = if ($ipIface) { $ipIface.Dhcp } else { 'Unknown' }
+            InterfaceMetric       = if ($ipIface -and "$($ipIface.AutomaticMetric)" -ne 'Enabled') { [int]$ipIface.InterfaceMetric } else { $null }
         }
     }
 }
@@ -521,6 +553,8 @@ function New-InterfacePlan {
         Gateway              = $null
         DnsPrimary           = $null
         DnsSecondary         = $null
+        SetMetric            = $false
+        InterfaceMetric      = $null
         AutoApply            = $false
         SkipSavePresetPrompt = $false
     }
@@ -593,6 +627,12 @@ function New-InterfacePlan {
     $plan.Gateway = $config.Gateway
     $plan.DnsPrimary = $config.DnsPrimary
     $plan.DnsSecondary = $config.DnsSecondary
+
+    # Metrique de l'interface : s'applique en DHCP comme en statique. Vide = auto
+    # (Windows calcule d'apres la vitesse du lien). Non demande sur le chemin
+    # "charger un preset immediatement", qui court-circuite les prompts plus haut.
+    $plan.SetMetric = $true
+    $plan.InterfaceMetric = Read-MetricWithDefault -Prompt "Métrique de l'interface" -Default $Current.InterfaceMetric -AllowAuto
 
     return $plan
 }
@@ -690,6 +730,12 @@ function Show-PlanSummary {
         Write-Host ("  Passerelle  : {0} -> {1}" -f (Format-OrDefault $Current.Gateway '(aucune)'), (Format-OrDefault $Plan.Gateway '(aucune)'))
     }
 
+    if ($Plan.SetMetric) {
+        $metricAvant = if ($null -eq $Current.InterfaceMetric) { 'auto' } else { "$($Current.InterfaceMetric)" }
+        $metricApres = if ($null -eq $Plan.InterfaceMetric) { 'auto' } else { "$($Plan.InterfaceMetric)" }
+        Write-Host ("  Métrique    : {0} -> {1}" -f $metricAvant, $metricApres)
+    }
+
     Write-Host ("  DNS primaire   : {0} -> {1}" -f (Format-OrDefault ($Current.DnsServers | Select-Object -First 1) '(aucun)'), (Format-OrDefault $Plan.DnsPrimary '(aucun)'))
     Write-Host ("  DNS secondaire : {0} -> {1}" -f (Format-OrDefault ($Current.DnsServers | Select-Object -Skip 1 -First 1) '(aucun)'), (Format-OrDefault $Plan.DnsSecondary '(aucun)'))
     Write-Host ""
@@ -720,6 +766,15 @@ function Invoke-ApplyPlan {
             Set-NetIPInterface -InterfaceIndex $Plan.IfIndex -Dhcp Enabled
         } else {
             Set-NetIPInterface -InterfaceIndex $Plan.IfIndex -Dhcp Disabled
+        }
+
+        # Metrique de l'interface : $null => metrique automatique, sinon valeur fixe.
+        if ($Plan.SetMetric) {
+            if ($null -eq $Plan.InterfaceMetric) {
+                Set-NetIPInterface -InterfaceIndex $Plan.IfIndex -AutomaticMetric Enabled
+            } else {
+                Set-NetIPInterface -InterfaceIndex $Plan.IfIndex -AutomaticMetric Disabled -InterfaceMetric $Plan.InterfaceMetric
+            }
         }
 
         Get-NetIPAddress -InterfaceIndex $Plan.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
@@ -1799,11 +1854,15 @@ function Invoke-AddRoute {
     $destNetwork = ConvertTo-DottedDecimal ($ipValue -band $maskValue)
     $maskDotted = ConvertFrom-PrefixLength $prefix
 
+    # Metrique de la route. Auto : route.exe la derive de la metrique de l'interface.
+    $metric = Read-MetricWithDefault -Prompt "Métrique de la route" -Default $null -AllowAuto
+
     $persist = Read-YesNo -Prompt "Rendre cette route persistante (survit au redémarrage) ?" -Default $false
 
     $routeArgs = @()
     if ($persist) { $routeArgs += '-p' }
     $routeArgs += @('add', $destNetwork, 'mask', $maskDotted, $gateway)
+    if ($null -ne $metric) { $routeArgs += @('metric', "$metric") }
 
     Write-Host ""
     Write-Host ("  route {0}" -f ($routeArgs -join ' ')) -ForegroundColor DarkGray
