@@ -9,7 +9,14 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Version affichee sur l'ecran d'accueil. A garder synchronisee avec MyAppVersion dans Setup.iss.
-$script:AppVersion = '1.3.1'
+$script:AppVersion = '1.3.2'
+
+# Positionne par Wait-EnterOrEscape quand Echap est presse (jamais quand c'est Entree) : signale
+# aux boucles de menu imbriquees (Show-ToolsSubmenu, Show-InterfaceHubMenu, Invoke-RouteManager,
+# etc.) qu'il faut remonter jusqu'au menu principal plutot que de se redessiner elles-memes.
+# Initialise ici car Set-StrictMode -Version Latest fait echouer la lecture d'une variable
+# jamais assignee. Remis a $false au debut de chaque tour de Start-MainLoop.
+$script:ReturnToMainMenu = $false
 
 # Force l'UTF-8 en sortie pour que les caractères accentués s'affichent correctement,
 # quel que soit l'hôte (Windows Terminal, conhost, ISE...).
@@ -147,12 +154,17 @@ function Read-MetricWithDefault {
     }
 }
 
+# Entree : reprend normalement (retour au sous-menu immediat, quel qu'il soit). Echap :
+# positionne $script:ReturnToMainMenu, que les boucles de menu imbriquees relaient jusqu'au
+# menu principal (voir la declaration de la variable en tete de script). Le message par
+# defaut est donc desormais exact dans tous les cas : Echap ramene TOUJOURS au menu principal.
 function Wait-EnterOrEscape {
-    param([string]$Message = "Appuyez sur Entrée ou Échap pour revenir au menu principal")
+    param([string]$Message = "Appuyez sur Entrée pour continuer, Échap pour revenir au menu principal")
     Write-Host "`n$Message" -ForegroundColor DarkGray
     while ($true) {
         $key = [Console]::ReadKey($true)
-        if ($key.Key -eq 'Enter' -or $key.Key -eq 'Escape') { break }
+        if ($key.Key -eq 'Enter') { break }
+        if ($key.Key -eq 'Escape') { $script:ReturnToMainMenu = $true; break }
     }
 }
 
@@ -279,6 +291,82 @@ function Read-CidrWithDefault {
     return "$ipVal/$prefix"
 }
 
+# Variantes "annulables a tout moment" des saisies ci-dessus, utilisees par le sous-menu
+# Parametres IP (Echap = abandon immediat, sans appliquer aucune modification). Basees sur
+# Read-HostWithEscape (saisie caractere par caractere, deja utilisee ailleurs dans le script
+# pour ce meme besoin) plutot que sur Read-Host/Read-WithDefault, qui ne detectent pas Echap.
+# Retournent $null si Echap ; distinct de '' qui signifie "valeur effacee/absente".
+function Read-IPv4WithEscape {
+    param([string]$Prompt, [string]$Default, [bool]$AllowEmpty = $true)
+    $hasCurrent = -not [string]::IsNullOrWhiteSpace($Default)
+    $displayPrompt = if ($hasCurrent) { "$Prompt (x = supprimer la valeur actuelle)" } else { $Prompt }
+    while ($true) {
+        $val = Read-HostWithEscape -Prompt $displayPrompt -Default $Default
+        if ($null -eq $val) { return $null }
+        if ($hasCurrent -and (Test-ClearToken -InputValue $val)) { return '' }
+        if ($AllowEmpty -and [string]::IsNullOrWhiteSpace($val)) { return $val }
+        if (Test-IPv4Address -InputValue $val) { return $val }
+        Write-Host "  Adresse IPv4 invalide (ex: 192.168.1.10)." -ForegroundColor Yellow
+    }
+}
+
+function Read-SubnetMaskWithEscape {
+    param([string]$Prompt, [int]$DefaultPrefixLength = 24)
+    while ($true) {
+        $val = Read-HostWithEscape -Prompt $Prompt -Default "$DefaultPrefixLength"
+        if ($null -eq $val) { return $null }
+        $prefix = ConvertTo-PrefixLength -InputValue $val
+        if ($null -ne $prefix) { return $prefix }
+        Write-Host "  Masque invalide. Attendu : /24 ou 255.255.255.0" -ForegroundColor Yellow
+    }
+}
+
+function Read-CidrWithEscape {
+    param([string]$Prompt, [string]$Default, [bool]$AllowClear = $false)
+    $hasCurrent = $AllowClear -and (-not [string]::IsNullOrWhiteSpace($Default))
+
+    $defaultIp = ''
+    $defaultPrefix = 24
+    if ($Default -match '^(?<ip>(\d{1,3}\.){3}\d{1,3})/(?<prefix>\d{1,2})$') {
+        $defaultIp = $Matches.ip
+        $defaultPrefix = [int]$Matches.prefix
+    }
+
+    $ipDisplayPrompt = if ($hasCurrent) { "$Prompt (x = supprimer)" } else { $Prompt }
+    while ($true) {
+        $ipVal = Read-HostWithEscape -Prompt $ipDisplayPrompt -Default $defaultIp
+        if ($null -eq $ipVal) { return $null }
+        if ($hasCurrent -and (Test-ClearToken -InputValue $ipVal)) { return '' }
+        if (-not [string]::IsNullOrWhiteSpace($ipVal) -and (Test-IPv4Address -InputValue $ipVal)) { break }
+        Write-Host "  Adresse IPv4 invalide (ex: 192.168.1.10)." -ForegroundColor Yellow
+    }
+
+    $prefix = Read-SubnetMaskWithEscape -Prompt "  Masque de sous-réseau (CIDR /24 ou décimal 255.255.255.0)" -DefaultPrefixLength $defaultPrefix
+    if ($null -eq $prefix) { return $null }
+    return "$ipVal/$prefix"
+}
+
+# Equivalent annulable de Read-YesNo (Echap = abandon), base sur Show-ArrowMenu qui
+# detecte deja Echap nativement (renvoie -1). Retourne $null si Echap.
+function Read-YesNoWithEscape {
+    param([string]$Prompt, [bool]$Default = $false)
+    $defaultIndex = if ($Default) { 0 } else { 1 }
+    $choice = Show-ArrowMenu -Title $Prompt -Items @('Oui', 'Non') -DefaultIndex $defaultIndex
+    if ($choice -lt 0) { return $null }
+    return ($choice -eq 0)
+}
+
+# Lit un MTU (octets). 68 = minimum IPv4 valide ; 9216 couvre les trames jumbo usuelles.
+function Read-MtuWithDefault {
+    param([string]$Prompt, [int]$Default)
+    while ($true) {
+        $val = Read-WithDefault -Prompt $Prompt -Default "$Default"
+        $n = 0
+        if ([int]::TryParse($val, [ref]$n) -and $n -ge 68 -and $n -le 9216) { return $n }
+        Write-Host "  MTU invalide (entier entre 68 et 9216)." -ForegroundColor Yellow
+    }
+}
+
 # Verifie que la passerelle appartient au meme sous-reseau que l'adresse IP/masque
 # donnee. Sans ce controle, une passerelle hors sous-reseau est acceptee par
 # New-NetIPAddress qui echoue ensuite silencieusement, laissant l'interface sans IP
@@ -304,7 +392,25 @@ function Test-GatewayInSubnet {
     return ($ipValue -band $maskValue) -eq ($gwValue -band $maskValue)
 }
 
+# Raccourcis clavier globaux (Ctrl+lettre), interceptes par Show-ArrowMenu et donc valables
+# depuis n'importe quel menu a fleches de l'application. La logique de chaque raccourci est
+# dans Invoke-GlobalShortcut (region Menus principaux), definie plus loin dans le fichier mais
+# resolue a l'execution (jamais appelee avant que tout le script soit charge).
+$script:GlobalShortcuts = @{
+    [ConsoleKey]::I = 'ManageInterface'
+    [ConsoleKey]::P = 'Presets'
+    [ConsoleKey]::D = 'DhcpAutoPreset'
+    [ConsoleKey]::E = 'ConfigExport'
+    [ConsoleKey]::N = 'DnsMenu'
+    [ConsoleKey]::R = 'Routes'
+    [ConsoleKey]::Q = 'Quit'
+}
+
 # Menu générique navigable aux flèches Haut/Bas + Entrée. Retourne l'index choisi (-1 si Échap).
+# Ignore automatiquement les lignes non selectionnables (titres "===" et lignes vides) lors de
+# la navigation Haut/Bas ; Page Haut/Bas sautent de section en section quand le menu en contient
+# (sinon, comportement de defilement normal par page). Ctrl+lettre declenche les raccourcis
+# globaux ci-dessus depuis n'importe quel menu, puis redessine ce menu a l'identique.
 function Show-ArrowMenu {
     param(
         [string]$Title,
@@ -315,6 +421,29 @@ function Show-ArrowMenu {
     $count = $Items.Count
     $selected = [Math]::Max(0, [Math]::Min($DefaultIndex, $count - 1))
     $width = [Math]::Max(40, [Console]::WindowWidth - 2)
+
+    # Lignes non selectionnables : titres de section ("=== ... ===") et lignes vides utilisees
+    # comme separateurs. Haut/Bas les sautent ; Page Haut/Bas s'en servent comme frontieres de
+    # section quand il y en a (menu principal), sinon ces touches gardent leur ancien role de
+    # defilement par page (listes plates : interfaces, presets, actions...).
+    $isSelectable = @($Items | ForEach-Object { $_ -notmatch '^===' -and $_ -ne '' })
+    $headerIdxs = @(for ($i = 0; $i -lt $count; $i++) { if ($Items[$i] -match '^===') { $i } })
+    $hasSections = $headerIdxs.Count -gt 0
+    if (-not $isSelectable[$selected]) {
+        for ($i = 0; $i -lt $count; $i++) { if ($isSelectable[$i]) { $selected = $i; break } }
+    }
+    $findFirstSelectableFrom = {
+        param($Start)
+        for ($j = $Start; $j -lt $count; $j++) { if ($isSelectable[$j]) { return $j } }
+        for ($j = 0; $j -lt $count; $j++) { if ($isSelectable[$j]) { return $j } }
+        return $Start
+    }
+    $findLastSelectableUpTo = {
+        param($EndIncl)
+        for ($j = $EndIncl; $j -ge 0; $j--) { if ($isSelectable[$j]) { return $j } }
+        for ($j = $count - 1; $j -ge 0; $j--) { if ($isSelectable[$j]) { return $j } }
+        return $EndIncl
+    }
 
     # Fenetre de defilement : on ne dessine qu'un sous-ensemble tenant a l'ecran. On se limite au
     # PLUS PETIT de la fenetre et du buffer (dans certains hotes — terminal VS Code — le buffer est
@@ -407,15 +536,49 @@ function Show-ArrowMenu {
             # Curseur gare a un endroit fixe pour eviter tout "saut" visuel entre les frappes.
             [Console]::SetCursorPosition(0, $top)
             $key = [Console]::ReadKey($true)
+
+            if (($key.Modifiers -band [ConsoleModifiers]::Control) -and $script:GlobalShortcuts.ContainsKey($key.Key)) {
+                Invoke-GlobalShortcut -Action $script:GlobalShortcuts[$key.Key]
+                # L'action invoquee a pu redessiner tout l'ecran (Clear-Host) : on ne redessine
+                # pas ce menu par-dessus ce qui reste affiche. -2 (distinct d'Echap = -1) se
+                # propage comme un Echap dans tous les menus imbriques (tous traitent deja
+                # "< 0" comme "sortir"), ce qui fait remonter jusqu'au menu principal, seul
+                # niveau qui redessine inconditionnellement (Clear-Host) au prochain tour de
+                # boucle. Sentinelle distincte d'Echap : Start-MainLoop ne doit pas proposer
+                # de quitter l'application juste parce qu'un raccourci a ete utilise.
+                return -2
+            }
+
             $previous = $selected
             $prevOffset = $offset
             switch ($key.Key) {
-                'UpArrow'    { $selected = ($selected - 1 + $count) % $count }
-                'DownArrow'  { $selected = ($selected + 1) % $count }
-                'PageUp'     { $selected = [Math]::Max(0, $selected - $itemRows) }
-                'PageDown'   { $selected = [Math]::Min($count - 1, $selected + $itemRows) }
-                'Home'       { $selected = 0 }
-                'End'        { $selected = $count - 1 }
+                'UpArrow' {
+                    do { $selected = ($selected - 1 + $count) % $count } while (-not $isSelectable[$selected] -and $selected -ne $previous)
+                }
+                'DownArrow' {
+                    do { $selected = ($selected + 1) % $count } while (-not $isSelectable[$selected] -and $selected -ne $previous)
+                }
+                'PageUp' {
+                    if ($hasSections) {
+                        $curH = -1; foreach ($h in $headerIdxs) { if ($h -le $selected) { $curH = $h } }
+                        $prevH = -1; foreach ($h in $headerIdxs) { if ($h -lt $curH) { $prevH = $h } }
+                        $selected = & $findFirstSelectableFrom ($prevH + 1)
+                    } else {
+                        $selected = [Math]::Max(0, $selected - $itemRows)
+                    }
+                }
+                'PageDown' {
+                    if ($hasSections) {
+                        $curH = -1; foreach ($h in $headerIdxs) { if ($h -le $selected) { $curH = $h } }
+                        $nextH = -1; foreach ($h in $headerIdxs) { if ($h -gt $curH -and $nextH -lt 0) { $nextH = $h } }
+                        if ($nextH -ge 0) { $selected = & $findFirstSelectableFrom ($nextH + 1) }
+                        else { $selected = & $findLastSelectableUpTo ($count - 1) }
+                    } else {
+                        $selected = [Math]::Min($count - 1, $selected + $itemRows)
+                    }
+                }
+                'Home'       { $selected = & $findFirstSelectableFrom 0 }
+                'End'        { $selected = & $findLastSelectableUpTo ($count - 1) }
                 'Enter'      { return $selected }
                 'Spacebar'   { return $selected }
                 'Escape'     { return -1 }
@@ -504,6 +667,8 @@ function Get-NetworkInterfacesInfo {
             DnsServers            = $dnsList
             Dhcp                  = if ($ipIface) { $ipIface.Dhcp } else { 'Unknown' }
             InterfaceMetric       = if ($ipIface -and "$($ipIface.AutomaticMetric)" -ne 'Enabled') { [int]$ipIface.InterfaceMetric } else { $null }
+            LinkSpeed             = $a.LinkSpeed
+            Mtu                   = $a.MtuSize
         }
     }
 }
@@ -539,7 +704,10 @@ function New-InterfacePlan {
     param($Current, $PresetOverride = $null)
 
     $isEnabled = $Current.Status -eq 'Up'
-    $wantEnabled = Read-YesNo -Prompt "Activer l'interface '$($Current.Name)' ?" -Default $isEnabled
+    # Charger un preset implique de configurer l'interface : l'etape "Activer l'interface ?"
+    # n'a pas lieu d'etre dans ce cas (l'utilisateur vient justement de choisir un preset a
+    # appliquer) — on saute direct au chargement du preset.
+    $wantEnabled = if ($PresetOverride) { $true } else { Read-YesNo -Prompt "Activer l'interface '$($Current.Name)' ?" -Default $isEnabled }
 
     $plan = [PSCustomObject]@{
         IfIndex              = $Current.IfIndex
@@ -741,6 +909,63 @@ function Show-PlanSummary {
     Write-Host ""
 }
 
+# Applique le mode DHCP/Statique, l'adressage IPv4 et les DNS d'une interface. Extrait
+# d'Invoke-ApplyPlan pour etre reutilisable seul par le sous-menu "Parametres IP" (qui ne
+# doit pas toucher a l'etat active/desactive ni a la metrique). Fonctionne quel que soit
+# l'etat active/desactive courant de l'interface.
+function Invoke-ApplyIpSettings {
+    param($IfIndex, [string]$Name, [string]$Mode, [string]$PrimaryIP, [string[]]$ExtraIPs, [string]$Gateway, [string]$DnsPrimary, [string]$DnsSecondary)
+
+    try {
+        # Bascule le mode DHCP/Statique AVANT de nettoyer l'ancienne config IPv4 : si le
+        # nettoyage a lieu pendant que le DHCP est encore actif, le client DHCP peut
+        # reinstaller silencieusement l'IP/route qu'on vient de supprimer, provoquant un
+        # conflit ("Instance DefaultGateway already exists") au moment d'ajouter la nouvelle.
+        if ($Mode -eq 'DHCP') {
+            Set-NetIPInterface -InterfaceIndex $IfIndex -Dhcp Enabled
+        } else {
+            Set-NetIPInterface -InterfaceIndex $IfIndex -Dhcp Disabled
+        }
+
+        Get-NetIPAddress -InterfaceIndex $IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+        Get-NetRoute -InterfaceIndex $IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } |
+            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
+
+        if ($Mode -eq 'Static') {
+            $primary = $PrimaryIP -split '/'
+            $ipParams = @{
+                InterfaceIndex = $IfIndex
+                IPAddress      = $primary[0]
+                PrefixLength   = [int]$primary[1]
+            }
+            if (-not [string]::IsNullOrWhiteSpace($Gateway)) {
+                $ipParams.DefaultGateway = $Gateway
+            }
+            New-NetIPAddress @ipParams | Out-Null
+
+            foreach ($extra in $ExtraIPs) {
+                $parts = $extra -split '/'
+                New-NetIPAddress -InterfaceIndex $IfIndex -IPAddress $parts[0] -PrefixLength ([int]$parts[1]) | Out-Null
+            }
+        }
+
+        $dnsServers = @($DnsPrimary, $DnsSecondary | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($dnsServers.Count -gt 0) {
+            Set-DnsClientServerAddress -InterfaceIndex $IfIndex -ServerAddresses $dnsServers
+        } else {
+            Set-DnsClientServerAddress -InterfaceIndex $IfIndex -ResetServerAddresses
+        }
+
+        Write-Host "Configuration IP appliquée avec succès sur '$Name'." -ForegroundColor Green
+        return $true
+    } catch {
+        Write-Host "Erreur lors de l'application de la configuration IP : $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
 function Invoke-ApplyPlan {
     param($Plan)
 
@@ -758,16 +983,6 @@ function Invoke-ApplyPlan {
             Start-Sleep -Seconds 2
         }
 
-        # Bascule le mode DHCP/Statique AVANT de nettoyer l'ancienne config IPv4 : si le
-        # nettoyage a lieu pendant que le DHCP est encore actif, le client DHCP peut
-        # reinstaller silencieusement l'IP/route qu'on vient de supprimer, provoquant un
-        # conflit ("Instance DefaultGateway already exists") au moment d'ajouter la nouvelle.
-        if ($Plan.Mode -eq 'DHCP') {
-            Set-NetIPInterface -InterfaceIndex $Plan.IfIndex -Dhcp Enabled
-        } else {
-            Set-NetIPInterface -InterfaceIndex $Plan.IfIndex -Dhcp Disabled
-        }
-
         # Metrique de l'interface : $null => metrique automatique, sinon valeur fixe.
         if ($Plan.SetMetric) {
             if ($null -eq $Plan.InterfaceMetric) {
@@ -777,39 +992,8 @@ function Invoke-ApplyPlan {
             }
         }
 
-        Get-NetIPAddress -InterfaceIndex $Plan.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-        Get-NetRoute -InterfaceIndex $Plan.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue |
-            Where-Object { $_.DestinationPrefix -eq '0.0.0.0/0' } |
-            Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
-
-        if ($Plan.Mode -eq 'Static') {
-            $primary = $Plan.PrimaryIP -split '/'
-            $ipParams = @{
-                InterfaceIndex = $Plan.IfIndex
-                IPAddress      = $primary[0]
-                PrefixLength   = [int]$primary[1]
-            }
-            if (-not [string]::IsNullOrWhiteSpace($Plan.Gateway)) {
-                $ipParams.DefaultGateway = $Plan.Gateway
-            }
-            New-NetIPAddress @ipParams | Out-Null
-
-            foreach ($extra in $Plan.ExtraIPs) {
-                $parts = $extra -split '/'
-                New-NetIPAddress -InterfaceIndex $Plan.IfIndex -IPAddress $parts[0] -PrefixLength ([int]$parts[1]) | Out-Null
-            }
-        }
-
-        $dnsServers = @($Plan.DnsPrimary, $Plan.DnsSecondary | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($dnsServers.Count -gt 0) {
-            Set-DnsClientServerAddress -InterfaceIndex $Plan.IfIndex -ServerAddresses $dnsServers
-        } else {
-            Set-DnsClientServerAddress -InterfaceIndex $Plan.IfIndex -ResetServerAddresses
-        }
-
-        Write-Host "Configuration appliquée avec succès sur '$($Plan.Name)'." -ForegroundColor Green
-        return $true
+        return Invoke-ApplyIpSettings -IfIndex $Plan.IfIndex -Name $Plan.Name -Mode $Plan.Mode -PrimaryIP $Plan.PrimaryIP `
+            -ExtraIPs $Plan.ExtraIPs -Gateway $Plan.Gateway -DnsPrimary $Plan.DnsPrimary -DnsSecondary $Plan.DnsSecondary
     } catch {
         Write-Host "Erreur lors de l'application de la configuration : $($_.Exception.Message)" -ForegroundColor Red
         return $false
@@ -1023,11 +1207,202 @@ function Get-VisibleInterfaces {
 
 #region Menus principaux
 
+# Annule sans rien appliquer : message + pause, puis retour a l'appelant. Factorise les
+# nombreux points de sortie "Echap" du sous-menu Parametres IP (voir Invoke-InterfaceIpSettings).
+function Write-CancelledMessage {
+    Write-Host "`nModifications annulées." -ForegroundColor Yellow
+    Wait-EnterOrEscape
+}
+
+# Sous-menu 1 du hub d'interface : mode IP, adresse(s), passerelle, DNS. Echap annule a
+# tout moment (aucune modification n'est appliquee avant la confirmation finale), via les
+# variantes *WithEscape des saisies habituelles.
+function Invoke-InterfaceIpSettings {
+    param($Current)
+    Clear-Host
+    Write-Host "=== Paramètres IP : $($Current.Name) ===" -ForegroundColor Cyan
+    Write-Host "  (Échap à tout moment annule sans appliquer de modification)" -ForegroundColor DarkGray
+    Write-Host ""
+
+    $defaultModeIndex = if ($Current.Dhcp -eq 'Enabled') { 0 } else { 1 }
+    $modeChoice = Show-ArrowMenu -Title "Mode d'adressage IP :" -Items @('DHCP (automatique)', 'IP statique') -DefaultIndex $defaultModeIndex
+    if ($modeChoice -lt 0) { Write-CancelledMessage; return }
+    $mode = if ($modeChoice -eq 0) { 'DHCP' } else { 'Static' }
+
+    $primaryIp = ''
+    $extraIps = [System.Collections.Generic.List[string]]::new()
+    $gateway = ''
+    if ($mode -eq 'Static') {
+        $defaultPrimary = if ($Current.IPAddresses.Count -gt 0) { $Current.IPAddresses[0] } else { '' }
+        $primaryIp = Read-CidrWithEscape -Prompt "Adresse IP + masque (CIDR)" -Default $defaultPrimary
+        if ($null -eq $primaryIp) { Write-CancelledMessage; return }
+
+        foreach ($e in @($Current.IPAddresses | Select-Object -Skip 1)) {
+            $kept = Read-CidrWithEscape -Prompt "  Adresse IP supplémentaire existante" -Default $e -AllowClear $true
+            if ($null -eq $kept) { Write-CancelledMessage; return }
+            if (-not [string]::IsNullOrWhiteSpace($kept)) { $extraIps.Add($kept) }
+        }
+        while ($true) {
+            $addMore = Read-YesNoWithEscape -Prompt "Ajouter une adresse IP supplémentaire ?" -Default $false
+            if ($null -eq $addMore) { Write-CancelledMessage; return }
+            if (-not $addMore) { break }
+            $extraIp = Read-CidrWithEscape -Prompt "  Adresse IP supplémentaire (CIDR)" -Default ''
+            if ($null -eq $extraIp) { Write-CancelledMessage; return }
+            $extraIps.Add($extraIp)
+        }
+
+        while ($true) {
+            $gateway = Read-IPv4WithEscape -Prompt "Passerelle par défaut" -Default $Current.Gateway
+            if ($null -eq $gateway) { Write-CancelledMessage; return }
+            if (Test-GatewayInSubnet -IpCidr $primaryIp -Gateway $gateway) { break }
+            Write-Host "  La passerelle n'est pas dans le même sous-réseau que l'adresse IP ($primaryIp)." -ForegroundColor Yellow
+        }
+    }
+
+    $dnsPrimaryDefault = if ($Current.DnsServers.Count -gt 0) { $Current.DnsServers[0] } else { '' }
+    $dnsSecondaryDefault = if ($Current.DnsServers.Count -gt 1) { $Current.DnsServers[1] } else { '' }
+    $dnsPrimary = Read-IPv4WithEscape -Prompt "Serveur DNS primaire" -Default $dnsPrimaryDefault
+    if ($null -eq $dnsPrimary) { Write-CancelledMessage; return }
+    $dnsSecondary = Read-IPv4WithEscape -Prompt "Serveur DNS secondaire" -Default $dnsSecondaryDefault
+    if ($null -eq $dnsSecondary) { Write-CancelledMessage; return }
+
+    Write-Host ""
+    Write-Host "===== Résumé des modifications : $($Current.Name) =====" -ForegroundColor Cyan
+    $modeAvant = switch ($Current.Dhcp) { 'Enabled' { 'DHCP' } 'Disabled' { 'Statique' } default { "$_" } }
+    $modeApres = if ($mode -eq 'DHCP') { 'DHCP' } else { 'Statique' }
+    Write-Host ("  Mode IP     : {0} -> {1}" -f $modeAvant, $modeApres)
+    if ($mode -eq 'Static') {
+        $ipAvant = if ($Current.IPAddresses.Count -gt 0) { $Current.IPAddresses -join ', ' } else { '(aucune)' }
+        $ipApres = (@($primaryIp) + $extraIps) -join ', '
+        Write-Host ("  Adresse(s)  : {0} -> {1}" -f $ipAvant, $ipApres)
+        Write-Host ("  Passerelle  : {0} -> {1}" -f (Format-OrDefault $Current.Gateway '(aucune)'), (Format-OrDefault $gateway '(aucune)'))
+    }
+    Write-Host ("  DNS primaire   : {0} -> {1}" -f (Format-OrDefault ($Current.DnsServers | Select-Object -First 1) '(aucun)'), (Format-OrDefault $dnsPrimary '(aucun)'))
+    Write-Host ("  DNS secondaire : {0} -> {1}" -f (Format-OrDefault ($Current.DnsServers | Select-Object -Skip 1 -First 1) '(aucun)'), (Format-OrDefault $dnsSecondary '(aucun)'))
+    Write-Host ""
+
+    $confirmed = Read-YesNoWithEscape -Prompt "Confirmer et appliquer ces modifications ?" -Default $false
+    if ($confirmed -ne $true) { Write-CancelledMessage; return }
+
+    $extraIpsArray = $extraIps.ToArray()
+    $applied = Invoke-ApplyIpSettings -IfIndex $Current.IfIndex -Name $Current.Name -Mode $mode -PrimaryIP $primaryIp `
+        -ExtraIPs $extraIpsArray -Gateway $gateway -DnsPrimary $dnsPrimary -DnsSecondary $dnsSecondary
+    if ($applied) {
+        $presetData = [PSCustomObject]@{ Mode = $mode; PrimaryIP = $primaryIp; ExtraIPs = $extraIpsArray; Gateway = $gateway; DnsPrimary = $dnsPrimary; DnsSecondary = $dnsSecondary }
+        Invoke-SavePresetPrompt -Plan $presetData
+    }
+    Wait-EnterOrEscape
+}
+
+# Sous-menu 2 : bascule simple Activer/Desactiver, sans passer par le reste du plan.
+function Invoke-InterfaceToggle {
+    param($Current)
+    Clear-Host
+    Write-Host "=== Activer/désactiver : $($Current.Name) ===" -ForegroundColor Cyan
+    Write-Host ""
+    $isEnabled = $Current.Status -eq 'Up'
+    $action = if ($isEnabled) { 'Désactiver' } else { 'Activer' }
+    if (-not (Read-YesNo -Prompt "$action l'interface '$($Current.Name)' ?" -Default $true)) { return }
+    try {
+        if ($isEnabled) {
+            Disable-NetAdapter -Name $Current.Name -Confirm:$false
+            Write-Host "Interface '$($Current.Name)' désactivée." -ForegroundColor Green
+        } else {
+            Enable-NetAdapter -Name $Current.Name -Confirm:$false
+            Write-Host "Interface '$($Current.Name)' activée." -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+# Sous-menu 3 : metrique seule (auto ou fixe), independante du reste de la configuration.
+function Invoke-InterfaceMetric {
+    param($Current)
+    Clear-Host
+    Write-Host "=== Métrique de l'interface : $($Current.Name) ===" -ForegroundColor Cyan
+    Write-Host ""
+    $newMetric = Read-MetricWithDefault -Prompt "Métrique de l'interface" -Default $Current.InterfaceMetric -AllowAuto
+    try {
+        if ($null -eq $newMetric) {
+            Set-NetIPInterface -InterfaceIndex $Current.IfIndex -AutomaticMetric Enabled
+            Write-Host "Métrique automatique activée." -ForegroundColor Green
+        } else {
+            Set-NetIPInterface -InterfaceIndex $Current.IfIndex -AutomaticMetric Disabled -InterfaceMetric $newMetric
+            Write-Host "Métrique définie à $newMetric." -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+# Sous-menu 4 : MTU de l'interface (niveau IP, via NlMtuBytes).
+function Invoke-InterfaceMtu {
+    param($Current)
+    Clear-Host
+    Write-Host "=== MTU de l'interface : $($Current.Name) ===" -ForegroundColor Cyan
+    Write-Host ""
+    $currentMtu = if ($Current.Mtu) { $Current.Mtu } else { 1500 }
+    $newMtu = Read-MtuWithDefault -Prompt "MTU (octets)" -Default $currentMtu
+    if ($newMtu -eq $currentMtu) { return }
+    try {
+        Set-NetIPInterface -InterfaceIndex $Current.IfIndex -NlMtuBytes $newMtu
+        Write-Host "MTU défini à $newMtu octets." -ForegroundColor Green
+    } catch {
+        Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
+    }
+    Wait-EnterOrEscape
+}
+
+# Hub d'une interface : point d'entree de "Modifier une interface reseau" une fois
+# l'interface choisie. Decoupe en 4 actions independantes (au lieu d'un seul assistant
+# lineaire) pour aller au plus vite vers le reglage recherche : Parametres IP, puis
+# Activer/Desactiver, Metrique, MTU. Rafraichit l'etat de l'interface a chaque passage,
+# pour refleter immediatement les changements qui viennent d'etre appliques.
+function Show-InterfaceHubMenu {
+    param($Current)
+    $ifIndex = $Current.IfIndex
+    $lastIndex = 0
+    while ($true) {
+        $iface = Get-VisibleInterfaces | Where-Object { $_.IfIndex -eq $ifIndex } | Select-Object -First 1
+        if (-not $iface) { return }
+
+        Clear-Host
+        Write-Host "=== Interface : $($iface.Name) ($($iface.InterfaceDescription)) ===" -ForegroundColor Cyan
+        Write-Host ""
+        $etatColor = if ($iface.Status -eq 'Up') { 'Green' } else { 'Red' }
+        $etatLabel = if ($iface.Status -eq 'Up') { 'Activée' } else { 'Désactivée' }
+        Write-Host "  État        : " -NoNewline
+        Write-Host $etatLabel -ForegroundColor $etatColor
+        Write-Host "  Adresse(s)  : $(if ($iface.IPAddresses.Count -gt 0) { $iface.IPAddresses -join ', ' } else { '(aucune)' })"
+        Write-Host "  Métrique    : $(if ($null -eq $iface.InterfaceMetric) { 'auto' } else { "$($iface.InterfaceMetric)" })"
+        Write-Host "  MTU         : $($iface.Mtu)"
+        Write-Host ""
+
+        $toggleLabel = if ($iface.Status -eq 'Up') { "Désactiver l'interface" } else { "Activer l'interface" }
+        $items = @('Paramètres IP', $toggleLabel, "Métrique de l'interface", "Changer le MTU de l'interface", '<< Retour')
+        $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex
+
+        if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+        $lastIndex = $choice
+
+        switch ($choice) {
+            0 { Invoke-InterfaceIpSettings -Current $iface }
+            1 { Invoke-InterfaceToggle -Current $iface }
+            2 { Invoke-InterfaceMetric -Current $iface }
+            3 { Invoke-InterfaceMtu -Current $iface }
+        }
+        if ($script:ReturnToMainMenu) { return }
+    }
+}
+
 function Show-InterfaceSelectionScreen {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -1040,7 +1415,7 @@ function Show-InterfaceSelectionScreen {
 
     if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
 
-    Start-InterfaceWizard -Current $interfaces[$choice]
+    Show-InterfaceHubMenu -Current $interfaces[$choice]
 }
 
 function Show-OptionsMenu {
@@ -1051,7 +1426,7 @@ function Show-OptionsMenu {
     $allIfaces = @(Get-NetworkInterfacesInfo)
     if ($allIfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau trouvée." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -1101,7 +1476,7 @@ function Invoke-DhcpReleaseRenew {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -1285,7 +1660,7 @@ function Invoke-InterfaceStatistics {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -1364,7 +1739,7 @@ function Invoke-NetworkProfileManager {
     $profiles = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
     if ($profiles.Count -eq 0) {
         Write-Host "Aucun profil réseau trouvé." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -1376,7 +1751,7 @@ function Invoke-NetworkProfileManager {
 
     if ($target.NetworkCategory -eq 'DomainAuthenticated') {
         Write-Host "`nCette interface est gérée par le domaine (DomainAuthenticated) : catégorie non modifiable manuellement." -ForegroundColor Yellow
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -1931,12 +2306,41 @@ function Invoke-RouteManager {
             1 { Invoke-AddRoute }
             2 { Invoke-DeleteRoute }
         }
+        if ($script:ReturnToMainMenu) { return }
     }
 }
 
 #endregion
 
 #region Partages réseau (net use)
+
+# Teste le port SMB (445) de chaque serveur distinct trouve dans une liste de chemins
+# \\serveur\partage, en parallele (un seul test par serveur meme si plusieurs partages y
+# pointent). Necessaire car le champ Status de Get-SmbMapping est notoirement peu fiable :
+# Windows ne le rafraichit qu'a la prochaine sollicitation reelle du partage, si bien qu'un
+# lecteur activement utilise dans l'Explorateur (qui vient de le solliciter en l'affichant)
+# peut quand meme apparaitre "Disconnected" ici, ce processus-ci ne l'ayant lui-meme jamais
+# sollicite. Une sonde reseau live donne un statut fiable au moment de la consultation.
+function Get-ShareHostReachability {
+    param([string[]]$RemotePaths)
+    $hostNames = @($RemotePaths | ForEach-Object { if ($_ -match '^\\\\(?<h>[^\\]+)\\') { $Matches.h } } | Sort-Object -Unique)
+    if ($hostNames.Count -eq 0) { return @{} }
+
+    $results = $hostNames | ForEach-Object -Parallel {
+        $ok = $false
+        try {
+            $client = [System.Net.Sockets.TcpClient]::new()
+            $task = $client.ConnectAsync($_, 445)
+            $ok = $task.Wait(800) -and $client.Connected
+            $client.Close()
+        } catch {}
+        [PSCustomObject]@{ Host = $_; Ok = $ok }
+    } -ThrottleLimit 32
+
+    $map = @{}
+    foreach ($r in $results) { $map[$r.Host] = $r.Ok }
+    $map
+}
 
 # Liste structuree des partages connectes. Deux sources fusionnees :
 #  1. Get-SmbMapping : mappages VIVANTS de la session courante (celle du processus). Sous
@@ -1959,14 +2363,13 @@ function Get-ShareMappingList {
         }
     }
 
-    $list = [System.Collections.Generic.List[object]]::new()
+    $entries = [System.Collections.Generic.List[object]]::new()
     $seen = @{}
     foreach ($m in @(Get-SmbMapping -ErrorAction SilentlyContinue)) {
         $letterKey = if ($m.LocalPath) { $m.LocalPath.ToUpperInvariant() } else { '' }
-        $list.Add([PSCustomObject]@{
+        $entries.Add([PSCustomObject]@{
             Lecteur    = if ($m.LocalPath) { $m.LocalPath } else { '(sans lettre)' }
             Chemin     = $m.RemotePath
-            Statut     = "$($m.Status)"
             Persistant = if ($letterKey -and $persistent.ContainsKey($letterKey)) { 'Oui' } else { 'Non' }
         })
         if ($letterKey) { $seen[$letterKey] = $true }
@@ -1976,12 +2379,23 @@ function Get-ShareMappingList {
     # l'Explorateur (jeton non eleve), montes ailleurs mais pas dans ce processus.
     foreach ($kv in $persistent.GetEnumerator()) {
         if (-not $seen.ContainsKey($kv.Key)) {
-            $list.Add([PSCustomObject]@{
+            $entries.Add([PSCustomObject]@{
                 Lecteur    = $kv.Key
                 Chemin     = $kv.Value
-                Statut     = 'Non monté dans cette session'
                 Persistant = 'Oui'
             })
+        }
+    }
+
+    $reachability = Get-ShareHostReachability -RemotePaths @($entries | ForEach-Object { $_.Chemin })
+    $list = foreach ($e in $entries) {
+        $hostName = if ($e.Chemin -match '^\\\\(?<h>[^\\]+)\\') { $Matches.h } else { $null }
+        $statut = if ($hostName -and $reachability[$hostName]) { 'Accessible' } else { 'Injoignable' }
+        [PSCustomObject]@{
+            Lecteur    = $e.Lecteur
+            Chemin     = $e.Chemin
+            Statut     = $statut
+            Persistant = $e.Persistant
         }
     }
 
@@ -2376,6 +2790,7 @@ function Invoke-ShareManager {
             3 { Invoke-RemoveShare }
             4 { Invoke-RemoveAllShares }
         }
+        if ($script:ReturnToMainMenu) { return }
     }
 }
 
@@ -2435,6 +2850,7 @@ function Show-ShareOptionsMenu {
             Write-Host "Erreur : $($_.Exception.Message)" -ForegroundColor Red
         }
         Wait-EnterOrEscape
+        if ($script:ReturnToMainMenu) { return }
     }
 }
 
@@ -2618,7 +3034,8 @@ function Invoke-WakeOnLan {
             } catch {
                 Write-Host "`nErreur lors de l'envoi : $($_.Exception.Message)" -ForegroundColor Red
             }
-            Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+            Wait-EnterOrEscape
+            if ($script:ReturnToMainMenu) { return }
             continue
         }
 
@@ -2661,25 +3078,50 @@ function Invoke-ConfigExport {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
     $lines = [System.Collections.Generic.List[string]]::new()
     $lines.Add("Résumé de configuration réseau - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
     $lines.Add("")
+    # Ecrit a l'ecran (avec couleur d'etat) et alimente $lines (texte brut, pour l'export) dans
+    # la meme passe : les deux representations doivent rester en phase champ par champ.
     foreach ($iface in $interfaces) {
+        $etatLabel = if ($iface.Status -eq 'Up') { 'Activée (Link Up)' } else { 'Désactivée (Link Down)' }
+        $etatColor = if ($iface.Status -eq 'Up') { 'Green' } else { 'Red' }
+        # $iface.Dhcp est la valeur brute Windows ('Enabled'/'Disabled' = DHCP actif ou non,
+        # pas l'etat de l'interface) : traduite en "DHCP (automatique)"/"IP statique" pour
+        # rester coherente avec le vocabulaire utilise ailleurs (Show-PlanSummary).
+        $modeIpLabel = switch ($iface.Dhcp) {
+            'Enabled'  { 'DHCP (automatique)' }
+            'Disabled' { 'IP statique' }
+            default    { 'Inconnu' }
+        }
+
+        Write-Host "=== $($iface.Name) ($($iface.InterfaceDescription)) ===" -ForegroundColor DarkCyan
+        Write-Host "  État        : " -NoNewline
+        Write-Host $etatLabel -ForegroundColor $etatColor
+        Write-Host "  Vitesse     : $($iface.LinkSpeed)"
+        Write-Host "  MTU         : $($iface.Mtu)"
+        Write-Host "  MAC         : $($iface.MacAddress)"
+        Write-Host "  Mode IP     : $modeIpLabel"
+        Write-Host "  Adresse(s)  : $(if ($iface.IPAddresses.Count -gt 0) { $iface.IPAddresses -join ', ' } else { '(aucune)' })"
+        Write-Host "  Passerelle  : $(Format-OrDefault $iface.Gateway '(aucune)')"
+        Write-Host "  DNS         : $(if ($iface.DnsServers.Count -gt 0) { $iface.DnsServers -join ', ' } else { '(aucun)' })"
+        Write-Host ""
+
         $lines.Add("=== $($iface.Name) ($($iface.InterfaceDescription)) ===")
-        $lines.Add("  État        : $(if ($iface.Status -eq 'Up') { 'Activée' } else { 'Désactivée' })")
+        $lines.Add("  État        : $etatLabel")
+        $lines.Add("  Vitesse     : $($iface.LinkSpeed)")
+        $lines.Add("  MTU         : $($iface.Mtu)")
         $lines.Add("  MAC         : $($iface.MacAddress)")
-        $lines.Add("  Mode IP     : $($iface.Dhcp)")
+        $lines.Add("  Mode IP     : $modeIpLabel")
         $lines.Add("  Adresse(s)  : $(if ($iface.IPAddresses.Count -gt 0) { $iface.IPAddresses -join ', ' } else { '(aucune)' })")
         $lines.Add("  Passerelle  : $(Format-OrDefault $iface.Gateway '(aucune)')")
         $lines.Add("  DNS         : $(if ($iface.DnsServers.Count -gt 0) { $iface.DnsServers -join ', ' } else { '(aucun)' })")
         $lines.Add("")
     }
-
-    $lines | Write-Host
 
     if (-not (Read-YesNo -Prompt "Exporter ce résumé dans un fichier texte ?" -Default $false)) {
         return
@@ -2723,7 +3165,7 @@ function Invoke-ApplyPresetToInterface {
     $interfaces = @(Get-VisibleInterfaces)
     if ($interfaces.Count -eq 0) {
         Write-Host "Aucune interface réseau visible (vérifiez le menu Options)." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -2778,7 +3220,9 @@ function Show-PresetDetailMenu {
                 return
             } elseif ($actionChoice -eq 1) {
                 Show-PresetDetail -Preset $Preset
-                # Reboucle sur ce meme sous-menu plutot que de revenir a la liste des presets.
+                # Reboucle sur ce meme sous-menu plutot que de revenir a la liste des presets,
+                # sauf si Echap a ete presse sur cet ecran (remonte jusqu'au menu principal).
+                if ($script:ReturnToMainMenu) { return }
             }
         }
     }
@@ -2797,6 +3241,7 @@ function Show-PresetDetailMenu {
             return
         } elseif ($actionChoice -eq 1) {
             Show-PresetDetail -Preset $Preset
+            if ($script:ReturnToMainMenu) { return }
             continue
         } elseif ($actionChoice -eq 2) {
             Edit-Preset -Preset $Preset
@@ -2835,7 +3280,7 @@ function Invoke-PresetsExport {
     $customPresets = @($Presets | Where-Object { -not $_.IsBuiltin })
     if ($customPresets.Count -eq 0) {
         Write-Host "Aucun preset personnalisé à exporter (le preset DHCP système n'est pas un fichier)." -ForegroundColor Yellow
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -2851,7 +3296,7 @@ function Invoke-PresetsExport {
         Write-Host "`nErreur lors de l'export : $($_.Exception.Message)" -ForegroundColor Red
     }
 
-    Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+    Wait-EnterOrEscape
 }
 
 function Invoke-PresetsImport {
@@ -2863,7 +3308,7 @@ function Invoke-PresetsImport {
     if ($null -eq $zipPath) { return }
     if ([string]::IsNullOrWhiteSpace($zipPath) -or -not (Test-Path $zipPath)) {
         Write-Host "Fichier introuvable." -ForegroundColor Red
-        Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+        Wait-EnterOrEscape
         return
     }
 
@@ -2913,7 +3358,7 @@ function Invoke-PresetsImport {
         Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Wait-EnterOrEscape -Message "Appuyez sur Entrée ou Échap pour continuer"
+    Wait-EnterOrEscape
 }
 
 function Show-PresetsMenu {
@@ -2937,14 +3382,17 @@ function Show-PresetsMenu {
 
         if ($choice -eq $items.Count - 2) {
             Invoke-PresetsImport
+            if ($script:ReturnToMainMenu) { return }
             continue
         }
         if ($choice -eq $items.Count - 3) {
             Invoke-PresetsExport -Presets $presets
+            if ($script:ReturnToMainMenu) { return }
             continue
         }
 
         Show-PresetDetailMenu -Preset $presets[$choice]
+        if ($script:ReturnToMainMenu) { return }
     }
 }
 
@@ -2972,10 +3420,10 @@ function Start-MainLoop {
         [PSCustomObject]@{ Type = 'Item'; Label = 'Profil réseau (Public / Privé)'; Action = 'Profile' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Diagnostics ===' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'État & trafic'; Action = 'SubStatus' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Connectivité'; Action = 'SubConnectivity' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'DNS'; Action = 'SubDns' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'Réseau local'; Action = 'SubLan' }
-        [PSCustomObject]@{ Type = 'Item'; Label = 'État & trafic'; Action = 'SubStatus' }
+        [PSCustomObject]@{ Type = 'Item'; Label = 'Analyse du réseau local'; Action = 'SubLan' }
         [PSCustomObject]@{ Type = 'Blank'; Label = '' }
         [PSCustomObject]@{ Type = 'Header'; Label = '=== Outils ===' }
         [PSCustomObject]@{ Type = 'Item'; Label = 'Routage'; Action = 'Routes' }
@@ -2999,12 +3447,8 @@ function Start-MainLoop {
             [PSCustomObject]@{ Label = 'Traceroute (tracert)'; Action = 'Tracert' }
             [PSCustomObject]@{ Label = 'Test de port TCP'; Action = 'PortTest' }
         ) }
-        SubDns = @{ Title = 'DNS'; Entries = @(
-            [PSCustomObject]@{ Label = 'Résolution DNS (nslookup)'; Action = 'Dns' }
-            [PSCustomObject]@{ Label = 'Test de fuite DNS (dnsleak)'; Action = 'DnsLeak' }
-            [PSCustomObject]@{ Label = 'Vider le cache DNS (flushdns)'; Action = 'FlushDns' }
-        ) }
-        SubLan = @{ Title = 'Réseau local'; Entries = @(
+        SubDns = @{ Title = 'DNS'; Entries = $script:DnsSubmenuEntries }
+        SubLan = @{ Title = 'Analyse du réseau local'; Entries = @(
             [PSCustomObject]@{ Label = 'Scan du sous-réseau'; Action = 'SubnetScan' }
             [PSCustomObject]@{ Label = 'Table ARP (voisins réseau)'; Action = 'Arp' }
             [PSCustomObject]@{ Label = 'Réseaux Wi-Fi à proximité'; Action = 'Wifi' }
@@ -3024,10 +3468,18 @@ function Start-MainLoop {
     }
 
     while ($true) {
+        # Remis a plat a chaque retour au menu principal : qu'il ait servi a faire remonter
+        # un Echap depuis un sous-menu ou non, on est desormais "a la maison" et il ne doit
+        # pas rester positionne pour la prochaine action choisie ici.
+        $script:ReturnToMainMenu = $false
+
         Clear-Host
         Write-Host "=== Menu principal ===" -ForegroundColor Cyan
         $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex
 
+        # -2 : un raccourci global vient de s'executer (voir Show-ArrowMenu) - on est deja de
+        # retour au menu principal, pas de prompt de sortie a proposer. -1 = vrai Echap.
+        if ($choice -eq -2) { continue }
         if ($choice -lt 0) {
             Write-Host ""
             if (Read-YesNo -Prompt "Quitter le gestionnaire d'interfaces réseau ?" -Default $false) {
@@ -3050,6 +3502,36 @@ function Start-MainLoop {
             Show-ToolsSubmenu -Title $sm.Title -Entries $sm.Entries
         } else {
             Invoke-ToolAction -Action $entry.Action
+        }
+    }
+}
+
+# Entrees du sous-menu DNS, partagees entre $submenus (Start-MainLoop) et le raccourci
+# global Ctrl+N (Invoke-GlobalShortcut) : source unique pour eviter toute divergence.
+$script:DnsSubmenuEntries = @(
+    [PSCustomObject]@{ Label = 'Résolution DNS (nslookup)'; Action = 'Dns' }
+    [PSCustomObject]@{ Label = 'Test de fuite DNS (dnsleak)'; Action = 'DnsLeak' }
+    [PSCustomObject]@{ Label = 'Vider le cache DNS (flushdns)'; Action = 'FlushDns' }
+)
+
+# Cible des raccourcis clavier globaux (voir $script:GlobalShortcuts, region Helpers).
+# Appelee directement depuis Show-ArrowMenu, quel que soit le menu affiche au moment de la
+# frappe : chaque action se comporte comme si elle avait ete choisie depuis le menu principal.
+function Invoke-GlobalShortcut {
+    param([string]$Action)
+    switch ($Action) {
+        'ManageInterface' { Show-InterfaceSelectionScreen }
+        'Presets'         { Show-PresetsMenu }
+        'ConfigExport'    { Invoke-ConfigExport }
+        'Routes'          { Invoke-RouteManager }
+        'DhcpAutoPreset'  { Invoke-ApplyPresetToInterface -Preset (Get-BuiltinDhcpPreset) }
+        'DnsMenu'         { Show-ToolsSubmenu -Title 'DNS' -Entries $script:DnsSubmenuEntries }
+        'Quit' {
+            Clear-Host
+            if (Read-YesNo -Prompt "Quitter le gestionnaire d'interfaces réseau ?" -Default $false) {
+                Write-Host "`nÀ bientôt !" -ForegroundColor Cyan
+                exit
+            }
         }
     }
 }
@@ -3100,6 +3582,9 @@ function Show-ToolsSubmenu {
         if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
         $lastIndex = $choice
         Invoke-ToolAction -Action $Entries[$choice].Action
+        # L'outil vient de se terminer sur un Echap (voir Wait-EnterOrEscape) : on remonte
+        # jusqu'au menu principal plutot que de se redessiner soi-meme.
+        if ($script:ReturnToMainMenu) { return }
     }
 }
 
