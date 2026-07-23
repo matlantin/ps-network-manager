@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 # Version affichee sur l'ecran d'accueil. A garder synchronisee avec MyAppVersion dans Setup.iss.
-$script:AppVersion = '1.4.0'
+$script:AppVersion = '1.4.1'
 
 # Positionne par Wait-EnterOrEscape quand Echap est presse (jamais quand c'est Entree) : signale
 # aux boucles de menu imbriquees (Show-ToolsSubmenu, Show-InterfaceHubMenu, Invoke-RouteManager,
@@ -44,7 +44,7 @@ function Show-Banner {
     Write-Host "  Bienvenue ! Ce script interactif permet de configurer les interfaces réseau de cette machine." -ForegroundColor Gray
     Write-Host "  Il fournit également des presets de configuration IP et des outils de diagnostic réseau." -ForegroundColor Gray
     Write-Host "  Astuce : dans les menus, utilisez les flèches Haut/Bas puis Entrée." -ForegroundColor DarkGray
-    Write-Host "  Pour les questions, Entrée seule conserve la valeur actuelle affichée." -ForegroundColor DarkGray
+    Write-Host "  Appuyez sur Ctrl + h pour afficher l'aide et les raccourcis clavier." -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -411,7 +411,8 @@ $script:GlobalShortcuts = @{
 # Ignore automatiquement les lignes non selectionnables (titres "===" et lignes vides) lors de
 # la navigation Haut/Bas ; Page Haut/Bas sautent de section en section quand le menu en contient
 # (sinon, comportement de defilement normal par page). Ctrl+lettre declenche les raccourcis
-# globaux ci-dessus depuis n'importe quel menu, puis redessine ce menu a l'identique.
+# globaux ci-dessus depuis n'importe quel menu, puis redessine ce menu a l'identique. Chaque
+# entree affiche aussi un raccourci a une frappe (1-9 puis a, b, c...), sauf "<< Retour...".
 function Show-ArrowMenu {
     param(
         [string]$Title,
@@ -421,7 +422,12 @@ function Show-ArrowMenu {
         # Invoque apres un Clear-Host declenche par manque de place (voir plus bas) : permet
         # a l'appelant de reafficher le contexte important (ex. le resume des changements
         # juste avant une confirmation) qui serait sinon perdu.
-        [scriptblock]$OnClear
+        [scriptblock]$OnClear,
+        # Raccourcis fixes imposes par l'appelant (index -> caractere), ex. 'o' pour Options et
+        # 'q' pour Quitter dans le menu principal - plus mnemotechniques que l'attribution
+        # sequentielle automatique. Retires du bassin de caracteres auto-attribues aux autres
+        # entrees pour eviter tout conflit (voir plus bas).
+        [hashtable]$ShortcutOverrides
     )
     $count = $Items.Count
     $selected = [Math]::Max(0, [Math]::Min($DefaultIndex, $count - 1))
@@ -437,6 +443,52 @@ function Show-ArrowMenu {
     if (-not $isSelectable[$selected]) {
         for ($i = 0; $i -lt $count; $i++) { if ($isSelectable[$i]) { $selected = $i; break } }
     }
+
+    # Raccourcis a une seule frappe : chaque ligne selectionnable (sauf "<< Retour/Quitter...",
+    # exclue expressement) se voit assigner un caractere - chiffres 1-9 d'abord, puis lettres
+    # a, b, c... au-dela de 9 entrees. Un seul caractere, jamais de saisie a deux temps (choix
+    # explicite : la saisie a 2 chiffres essayee avant s'est averee peu appreciee). Taper le
+    # caractere selectionne ET valide directement l'entree, equivalent a naviguer dessus puis
+    # Entree. Les chiffres sont detectes via $key.Key (D1-D9/NumPad1-9, independant de la
+    # disposition clavier active) plutot que $key.KeyChar : sur un clavier AZERTY, la rangee de
+    # chiffres exige normalement Maj (le KeyChar sans Maj est un symbole/accent), alors que le
+    # code de touche D1-D9 correspond a la position physique de la rangee de chiffres quelle
+    # que soit la disposition - utilisable donc sans Maj, comme en QWERTY.
+    $shortcutIdxs = @(for ($i = 0; $i -lt $count; $i++) { if ($isSelectable[$i] -and $Items[$i] -notmatch '^<<') { $i } })
+    $shortcutCount = $shortcutIdxs.Count
+    $maxShortcuts = 9 + 26
+    $enableShortcutKeys = $shortcutCount -gt 0
+    $shortcutLabels = @{}
+    $shortcutIndexByChar = @{}
+
+    # Raccourcis fixes en premier (voir -ShortcutOverrides), leur caractere est retire du
+    # bassin auto-attribue plus bas pour qu'aucune autre entree ne puisse le reprendre.
+    $reservedChars = @{}
+    if ($ShortcutOverrides) {
+        foreach ($idx in $ShortcutOverrides.Keys) {
+            if ($shortcutIdxs -contains $idx) {
+                $char = $ShortcutOverrides[$idx].ToString().ToLowerInvariant()
+                $shortcutLabels[$idx] = $char
+                $shortcutIndexByChar[$char] = $idx
+                $reservedChars[$char] = $true
+            }
+        }
+    }
+
+    $autoChars = [System.Collections.Generic.List[string]]::new()
+    for ($n = 0; $n -lt 9; $n++) { $autoChars.Add("$($n + 1)") }
+    for ($n = 0; $n -lt 26; $n++) { $autoChars.Add([string][char](97 + $n)) }
+    $autoChars = @($autoChars | Where-Object { -not $reservedChars.ContainsKey($_) })
+
+    $autoPos = 0
+    foreach ($idx in $shortcutIdxs) {
+        if ($shortcutLabels.ContainsKey($idx)) { continue }
+        if ($autoPos -ge $autoChars.Count) { break }
+        $char = $autoChars[$autoPos]; $autoPos++
+        $shortcutLabels[$idx] = $char
+        $shortcutIndexByChar[$char] = $idx
+    }
+    $shortcutPrefixLen = 2
     $findFirstSelectableFrom = {
         param($Start)
         for ($j = $Start; $j -lt $count; $j++) { if ($isSelectable[$j]) { return $j } }
@@ -488,19 +540,39 @@ function Show-ArrowMenu {
     if ($Title -and -not $TitleAtBottom) { Write-Host $Title -ForegroundColor DarkGray }
     [Console]::CursorVisible = $false
 
-    # Couleur de repos de chaque ligne, precalculee une seule fois (en-tetes === en DarkCyan).
-    $baseColors = @($Items | ForEach-Object { if ($_ -match '^===') { 'DarkCyan' } else { 'Gray' } })
+    # Couleur de repos de chaque ligne, precalculee une seule fois (en-tetes === en DarkCyan ;
+    # entrees "<< Retour/Quitter..." en DarkGray, attenue plutot que le Cyan initialement
+    # essaye et juge trop voyant).
+    $baseColors = @($Items | ForEach-Object {
+        if ($_ -match '^===') { 'DarkCyan' }
+        elseif ($_ -match '^<<') { 'DarkGray' }
+        else { 'Gray' }
+    })
 
     $writeItem = {
         param($i, [bool]$InPlace, [switch]$Plain)
         $isHighlighted = ($i -eq $selected) -and -not $Plain
         $marker = if ($i -eq $selected) { ">" } else { " " }
-        $line = " $marker $($Items[$i])"
-        if ($line.Length -gt $width) { $line = $line.Substring(0, $width) }
-        $line = $line.PadRight($width)
-        $colors = if ($isHighlighted) { @{ ForegroundColor = 'Black'; BackgroundColor = 'Cyan' } }
-                  else { @{ ForegroundColor = $baseColors[$i] } }
-        Write-Host $line -NoNewline:$InPlace @colors
+        $shortcutPrefix = if ($shortcutLabels.ContainsKey($i)) { "$($shortcutLabels[$i]) " } elseif ($enableShortcutKeys) { ' ' * $shortcutPrefixLen } else { '' }
+        # Normalise l'espacement apres "<<" (un seul espace dans le texte source un peu partout
+        # dans le script) a deux espaces, pour que le chevron se detache mieux visuellement du
+        # texte plutot que d'y coller.
+        $text = $Items[$i]
+        if ($text -match '^<<\s*') { $text = $text -replace '^<<\s*', '<<  ' }
+        $prefixRaw = " $marker $shortcutPrefix"
+        $fullLine = "$prefixRaw$text"
+        if ($fullLine.Length -gt $width) { $fullLine = $fullLine.Substring(0, $width) }
+        $fullLine = $fullLine.PadRight($width)
+
+        if ($isHighlighted) {
+            Write-Host $fullLine -NoNewline:$InPlace -ForegroundColor Black -BackgroundColor Cyan
+            return
+        }
+        # Non surligne : marqueur + raccourci attenues (DarkGray) pour que le libelle du menu
+        # ressorte davantage, dans sa couleur habituelle (Gray, DarkCyan pour un titre...).
+        $prefixLen = [Math]::Min($prefixRaw.Length, $fullLine.Length)
+        Write-Host $fullLine.Substring(0, $prefixLen) -NoNewline -ForegroundColor DarkGray
+        Write-Host $fullLine.Substring($prefixLen) -NoNewline:$InPlace -ForegroundColor $baseColors[$i]
     }
 
     # Ligne d'indicateur (haut/bas) : texte gris, remplie a $width pour effacer l'ancien contenu.
@@ -570,6 +642,22 @@ function Show-ArrowMenu {
                 # de quitter l'application juste parce qu'un raccourci a ete utilise.
                 $result = -2
                 return -2
+            }
+
+            if ($enableShortcutKeys -and -not ($key.Modifiers -band ([ConsoleModifiers]::Control -bor [ConsoleModifiers]::Alt))) {
+                $shortcutChar = $null
+                if ($key.Key -ge [ConsoleKey]::D1 -and $key.Key -le [ConsoleKey]::D9) {
+                    $shortcutChar = "$([int]$key.Key - [int][ConsoleKey]::D1 + 1)"
+                } elseif ($key.Key -ge [ConsoleKey]::NumPad1 -and $key.Key -le [ConsoleKey]::NumPad9) {
+                    $shortcutChar = "$([int]$key.Key - [int][ConsoleKey]::NumPad1 + 1)"
+                } elseif ($key.KeyChar -match '^[a-zA-Z]$') {
+                    $shortcutChar = $key.KeyChar.ToString().ToLowerInvariant()
+                }
+                if ($null -ne $shortcutChar -and $shortcutIndexByChar.ContainsKey($shortcutChar)) {
+                    $selected = $shortcutIndexByChar[$shortcutChar]
+                    $result = $selected
+                    return $selected
+                }
             }
 
             $previous = $selected
@@ -1223,7 +1311,7 @@ function Invoke-SavePresetPrompt {
 
 #endregion
 
-#region Préférences utilisateur (interfaces masquées)
+#region Préférences utilisateur (config.json)
 
 # Sauvegarde locale par utilisateur (%LOCALAPPDATA%\NetIfaceManager\config.json).
 # Les interfaces masquées sont identifiées par leur Name : simple et lisible,
@@ -1232,23 +1320,55 @@ function Get-ConfigPath {
     Join-Path $env:LOCALAPPDATA 'NetIfaceManager\config.json'
 }
 
-function Get-HiddenInterfaceNames {
+# Lit l'objet de config complet, en complétant les champs manquants avec leurs valeurs par
+# défaut (config.json d'une version antérieure sans le champ le plus récent) : sous
+# Set-StrictMode, lire une propriété absente d'un PSCustomObject issu de ConvertFrom-Json
+# lève une erreur, d'où le Add-Member plutôt qu'un simple accès direct.
+function Get-AppConfig {
     $path = Get-ConfigPath
-    if (-not (Test-Path $path)) { return @() }
+    $default = [PSCustomObject]@{ HiddenInterfaces = @(); AutoUpdateEnabled = $false; AutoUpdatePromptAnswered = $false }
+    if (-not (Test-Path $path)) { return $default }
     try {
         $json = Get-Content -Path $path -Raw | ConvertFrom-Json
-        return @($json.HiddenInterfaces)
+        foreach ($prop in $default.PSObject.Properties.Name) {
+            if ($json.PSObject.Properties.Name -notcontains $prop) {
+                $json | Add-Member -NotePropertyName $prop -NotePropertyValue $default.$prop
+            }
+        }
+        return $json
     } catch {
-        return @()
+        return $default
     }
+}
+
+function Save-AppConfig {
+    param($Config)
+    $path = Get-ConfigPath
+    $dir = Split-Path $path -Parent
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $Config | ConvertTo-Json | Set-Content -Path $path -Encoding UTF8
+}
+
+function Get-HiddenInterfaceNames {
+    @((Get-AppConfig).HiddenInterfaces)
 }
 
 function Save-HiddenInterfaceNames {
     param([string[]]$Names)
-    $path = Get-ConfigPath
-    $dir = Split-Path $path -Parent
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    [PSCustomObject]@{ HiddenInterfaces = @($Names) } | ConvertTo-Json | Set-Content -Path $path -Encoding UTF8
+    $config = Get-AppConfig
+    $config.HiddenInterfaces = @($Names)
+    Save-AppConfig -Config $config
+}
+
+function Get-AutoUpdateEnabled {
+    [bool](Get-AppConfig).AutoUpdateEnabled
+}
+
+function Set-AutoUpdateEnabled {
+    param([bool]$Enabled)
+    $config = Get-AppConfig
+    $config.AutoUpdateEnabled = $Enabled
+    Save-AppConfig -Config $config
 }
 
 function Get-VisibleInterfaces {
@@ -1257,6 +1377,182 @@ function Get-VisibleInterfaces {
     # sans ce wrap, $null atteindrait -ExcludeNames et ferait planter .Count plus loin.
     $hidden = @(Get-HiddenInterfaceNames)
     @(Get-NetworkInterfacesInfo -ExcludeNames $hidden)
+}
+
+#endregion
+
+# Question posee une seule fois (premier lancement, ou mise a jour depuis une version
+# anterieure a cette fonctionnalite) : active ou non la mise a jour automatique, puis
+# sauvegarde le choix dans config.json (AutoUpdatePromptAnswered = $true) pour ne plus
+# jamais reposer la question. Read-YesNo (pas la variante WithEscape) : deux choix francs,
+# pas de notion d'annulation ici.
+function Invoke-FirstLaunchUpdatePrompt {
+    Clear-Host
+    Write-Host "=== Mises à jour automatiques ===" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Ce script peut vérifier automatiquement une nouvelle version au démarrage" -ForegroundColor Gray
+    Write-Host "  et l'installer automatiquement (active au lancement suivant)." -ForegroundColor Gray
+    Write-Host "  Vous pourrez changer ce choix à tout moment depuis Options > Mises à jour." -ForegroundColor DarkGray
+    Write-Host ""
+    $enable = Read-YesNo -Prompt "Activer les mises à jour automatiques ?" -Default $true
+
+    $config = Get-AppConfig
+    $config.AutoUpdateEnabled = $enable
+    $config.AutoUpdatePromptAnswered = $true
+    Save-AppConfig -Config $config
+
+    Write-Host ("`n  Mises à jour automatiques : {0}." -f $(if ($enable) { 'activée' } else { 'désactivée' })) -ForegroundColor Green
+    Wait-EnterOrEscape
+}
+
+#region Mise à jour
+
+# Depot GitHub source des releases (tags vX.Y.Z, voir gh release create). Utilisé à la fois
+# pour l'API (dernier release) et pour le contenu brut du script sur ce tag précis.
+$script:UpdateRepo = 'matlantin/ps-network-manager'
+$script:UpdateScriptName = 'Gestion-Interfaces-Reseau.ps1'
+
+# Interroge l'API GitHub (releases/latest) et renvoie {Version, TagName, Notes, HtmlUrl},
+# ou $null en cas d'échec (pas de connexion, API indisponible...) — jamais d'exception qui
+# remonterait jusqu'à l'appelant (utilisé aussi bien en mode silencieux qu'interactif).
+function Get-LatestReleaseInfo {
+    try {
+        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$script:UpdateRepo/releases/latest" -Headers @{ 'User-Agent' = 'ps-network-manager' } -TimeoutSec 10 -ErrorAction Stop
+        [PSCustomObject]@{
+            Version = $release.tag_name.TrimStart('v')
+            TagName = $release.tag_name
+            Notes   = $release.body
+            HtmlUrl = $release.html_url
+        }
+    } catch {
+        $null
+    }
+}
+
+# [version] plutôt qu'une comparaison de chaînes : gère correctement "1.10.0" > "1.9.0".
+function Test-NewerVersion {
+    param([string]$RemoteVersion)
+    try {
+        return ([version]$RemoteVersion) -gt ([version]$script:AppVersion)
+    } catch {
+        return $false
+    }
+}
+
+# Télécharge le script depuis le tag exact de la release (raw.githubusercontent.com, contenu
+# figé de cette release — pas la branche master qui peut avoir avancé depuis), vérifie sa
+# syntaxe avant d'écraser le fichier en cours d'exécution (protection contre un téléchargement
+# tronqué/corrompu), et garde une sauvegarde .bak de l'ancien script.
+function Invoke-DownloadAndApplyUpdate {
+    param($ReleaseInfo)
+    $rawUrl = "https://raw.githubusercontent.com/$script:UpdateRepo/$($ReleaseInfo.TagName)/$script:UpdateScriptName"
+    try {
+        $content = Invoke-RestMethod -Uri $rawUrl -Headers @{ 'User-Agent' = 'ps-network-manager' } -TimeoutSec 15 -ErrorAction Stop
+    } catch {
+        return [PSCustomObject]@{ Success = $false; Error = "Téléchargement impossible : $($_.Exception.Message)" }
+    }
+
+    $parseErrors = $null
+    [System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$parseErrors) | Out-Null
+    if ($parseErrors.Count -gt 0) {
+        return [PSCustomObject]@{ Success = $false; Error = "Le fichier téléchargé est invalide (erreur de syntaxe) ; mise à jour annulée." }
+    }
+
+    $currentPath = $PSCommandPath
+    if ([string]::IsNullOrWhiteSpace($currentPath)) {
+        return [PSCustomObject]@{ Success = $false; Error = "Impossible de déterminer le chemin du script en cours (lancement non standard)." }
+    }
+
+    try {
+        Copy-Item -Path $currentPath -Destination "$currentPath.bak" -Force
+        Set-Content -Path $currentPath -Value $content -Encoding UTF8 -Force
+    } catch {
+        return [PSCustomObject]@{ Success = $false; Error = "Échec de l'écriture du fichier : $($_.Exception.Message)" }
+    }
+
+    [PSCustomObject]@{ Success = $true; Error = $null }
+}
+
+# Verifie (et propose d'installer) une mise à jour. -Silent : utilisé pour la vérification
+# automatique au démarrage — ne dit rien si tout est à jour ou si GitHub est injoignable,
+# et installe directement sans demander confirmation si une mise à jour est trouvée (active
+# au prochain lancement, la session en cours continue avec l'ancien code déjà chargé en
+# mémoire). Sans -Silent : écran complet interactif (menu Options > Mise à jour).
+function Invoke-CheckForUpdate {
+    param([switch]$Silent)
+
+    if (-not $Silent) {
+        Clear-Host
+        Write-Host "=== Vérifier les mises à jour ===" -ForegroundColor Cyan
+        Write-Host ("  Version installée : v{0}" -f $script:AppVersion) -ForegroundColor DarkGray
+        Write-Host "  Recherche d'une nouvelle version sur GitHub..." -ForegroundColor DarkGray
+        Write-Host ""
+    }
+
+    $release = Get-LatestReleaseInfo
+    if ($null -eq $release) {
+        if ($Silent) { return }
+        Write-Host "Impossible de contacter GitHub (vérifiez votre connexion internet)." -ForegroundColor Red
+        Wait-EnterOrEscape
+        return
+    }
+
+    if (-not (Test-NewerVersion -RemoteVersion $release.Version)) {
+        if ($Silent) { return }
+        Write-Host "Vous utilisez déjà la dernière version." -ForegroundColor Green
+        Wait-EnterOrEscape
+        return
+    }
+
+    if ($Silent) {
+        $result = Invoke-DownloadAndApplyUpdate -ReleaseInfo $release
+        if ($result.Success) {
+            # Ecran dedie + pause : sans ca, ce message serait efface presque aussitot par le
+            # Clear-Host du menu principal juste apres (Start-MainLoop), l'utilisateur n'aurait
+            # pas le temps de le voir.
+            Clear-Host
+            Write-Host "=== Mise à jour automatique ===" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host ("  Une nouvelle version (v{0}) a été téléchargée et installée automatiquement." -f $release.Version) -ForegroundColor Green
+            Write-Host "  Elle sera active au prochain lancement du script." -ForegroundColor Gray
+            Wait-EnterOrEscape
+        }
+        return
+    }
+
+    Clear-Host
+    Write-Host "=== Mise à jour disponible ===" -ForegroundColor Cyan
+    Write-Host ("  Version installée : v{0}" -f $script:AppVersion) -ForegroundColor DarkGray
+    Write-Host ("  Nouvelle version  : v{0}" -f $release.Version) -ForegroundColor Green
+    if (-not [string]::IsNullOrWhiteSpace($release.Notes)) {
+        Write-Host ""
+        Write-Host "  Notes de version :" -ForegroundColor DarkGray
+        foreach ($line in ($release.Notes -split "`r?`n")) {
+            Write-Host "  $line" -ForegroundColor Gray
+        }
+    }
+    Write-Host ""
+
+    $install = Read-YesNoWithEscape -Prompt "Télécharger et installer cette mise à jour maintenant ?" -Default $true
+    if ($null -eq $install -or -not $install) { return }
+
+    Write-Host ""
+    Write-Host "Téléchargement en cours..." -ForegroundColor Yellow
+    $result = Invoke-DownloadAndApplyUpdate -ReleaseInfo $release
+    if (-not $result.Success) {
+        Write-Host $result.Error -ForegroundColor Red
+        Wait-EnterOrEscape
+        return
+    }
+
+    Write-Host ("Mise à jour installée (v{0})." -f $release.Version) -ForegroundColor Green
+    $restart = Read-YesNoWithEscape -Prompt "Redémarrer le script maintenant ?" -Default $true
+    if ($restart) {
+        Write-Host "`nRedémarrage..." -ForegroundColor Cyan
+        Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-File', "`"$PSCommandPath`"") -Verb RunAs
+        exit
+    }
+    Wait-EnterOrEscape
 }
 
 #endregion
@@ -1461,7 +1757,7 @@ function Show-InterfaceHubMenu {
         Write-Host ""
 
         $toggleLabel = if ($iface.Status -eq 'Up') { "Désactiver l'interface" } else { "Activer l'interface" }
-        $items = @('Paramètres IP', 'Charger un preset', $toggleLabel, "Métrique", "MTU", '<< Retour')
+        $items = @('Paramètres IP', 'Charger un preset', $toggleLabel, "Métrique", "MTU", '', '<< Retour')
         $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex
 
         if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
@@ -1489,7 +1785,7 @@ function Show-InterfaceSelectionScreen {
     Clear-Host
     Write-Host "=== Sélectionnez une interface à gérer ===" -ForegroundColor Cyan
     $items = @($interfaces | ForEach-Object { Format-InterfaceLine -Iface $_ })
-    $items += "<< Retour au menu principal"
+    $items += '', "<< Retour au menu principal"
 
     $choice = Show-ArrowMenu -Items $items -DefaultIndex 0
 
@@ -1532,6 +1828,7 @@ function Show-KeyboardShortcutsHelp {
     Write-Host "    Page Haut / Bas  : sauter de section en section (menu principal) ; défilement par page ailleurs"
     Write-Host "    Début / Fin      : première / dernière option sélectionnable"
     Write-Host "    Entrée / Espace  : valider la sélection"
+    Write-Host "    1-9, a, b, c...  : taper le raccourci affiché devant une entrée pour la sélectionner et valider directement"
     Write-Host "    Échap            : annuler, ou revenir directement au menu principal depuis un sous-menu (Entrée y ramène au sous-menu immédiat)"
     Write-Host ""
     Wait-EnterOrEscape
@@ -1562,7 +1859,7 @@ function Show-OptionsMenu {
             $state = if ($hidden -contains $_.Name) { 'Masquée' } else { 'Visible' }
             "[{0,-7}] {1}" -f $state, (Format-InterfaceLine -Iface $_)
         })
-        $items += "<< Retour au menu principal"
+        $items += '', "<< Retour au menu principal"
 
         $choice = Show-ArrowMenu -Title "Utilisez Haut/Bas, Entrée ou Espace pour basculer :" -Items $items -DefaultIndex $lastIndex
         if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
@@ -1575,6 +1872,35 @@ function Show-OptionsMenu {
             $newHidden = @($hidden) + $target.Name
         }
         Save-HiddenInterfaceNames -Names $newHidden
+    }
+}
+
+# Ecran "Mise à jour" du menu Options : bascule la mise à jour automatique et/ou lance une
+# vérification manuelle immédiate. Position fixe (pas de $lastIndex à mémoriser, 3 entrées).
+function Show-UpdateOptionsMenu {
+    while ($true) {
+        $auto = Get-AutoUpdateEnabled
+
+        Clear-Host
+        Write-Host "=== Mises à jour ===" -ForegroundColor Cyan
+        Write-Host ("  Version installée : v{0}" -f $script:AppVersion) -ForegroundColor DarkGray
+        Write-Host ("  Mise à jour automatique au démarrage : {0}" -f $(if ($auto) { 'Activée' } else { 'Désactivée' })) -ForegroundColor DarkGray
+        Write-Host ""
+
+        $items = @(
+            $(if ($auto) { 'Désactiver les mises à jour automatiques' } else { 'Activer les mises à jour automatiques' }),
+            'Vérifier les mises à jour maintenant',
+            '',
+            '<< Retour'
+        )
+        $choice = Show-ArrowMenu -Items $items -DefaultIndex 0
+        if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
+
+        switch ($choice) {
+            0 { Set-AutoUpdateEnabled -Enabled (-not $auto) }
+            1 { Invoke-CheckForUpdate }
+        }
+        if ($script:ReturnToMainMenu) { return }
     }
 }
 
@@ -1602,7 +1928,7 @@ function Invoke-DhcpReleaseRenew {
     Clear-Host
     Write-Host "=== DHCP : Release / Renew ===" -ForegroundColor Cyan
     $items = @($interfaces | ForEach-Object { Format-InterfaceLine -Iface $_ })
-    $items += "<< Retour au menu principal"
+    $items += '', "<< Retour au menu principal"
 
     $ifaceChoice = Show-ArrowMenu -Title "Sélectionnez une interface :" -Items $items -DefaultIndex 0
     if ($ifaceChoice -lt 0 -or $ifaceChoice -eq $items.Count - 1) { return }
@@ -1786,7 +2112,7 @@ function Invoke-InterfaceStatistics {
     Clear-Host
     Write-Host "=== Statistiques d'interface en direct ===" -ForegroundColor Cyan
     $items = @($interfaces | ForEach-Object { Format-InterfaceLine -Iface $_ })
-    $items += "<< Retour au menu principal"
+    $items += '', "<< Retour au menu principal"
     $choice = Show-ArrowMenu -Title "Sélectionnez une interface :" -Items $items -DefaultIndex 0
     if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
     $target = $interfaces[$choice]
@@ -1863,7 +2189,7 @@ function Invoke-NetworkProfileManager {
     }
 
     $items = @($profiles | ForEach-Object { "{0,-25} [{1}]" -f $_.InterfaceAlias, $_.NetworkCategory })
-    $items += "<< Retour au menu principal"
+    $items += '', "<< Retour au menu principal"
     $choice = Show-ArrowMenu -Title "Sélectionnez une interface :" -Items $items -DefaultIndex 0
     if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
     $target = $profiles[$choice]
@@ -2417,7 +2743,7 @@ function Invoke-RouteManager {
         Clear-Host
         Write-Host "=== Table de routage ===" -ForegroundColor Cyan
         Write-Host ""
-        $actionItems = @('Afficher les routes', 'Ajouter une route', 'Supprimer une route', '<< Retour au menu principal')
+        $actionItems = @('Afficher les routes', 'Ajouter une route', 'Supprimer une route', '', '<< Retour au menu principal')
         $choice = Show-ArrowMenu -Title "Action :" -Items $actionItems -DefaultIndex 0
         if ($choice -lt 0 -or $choice -eq $actionItems.Count - 1) { return }
         switch ($choice) {
@@ -2898,6 +3224,7 @@ function Invoke-ShareManager {
             'Reconnecter un partage indisponible',
             'Déconnecter un partage',
             'Déconnecter TOUS les partages',
+            '',
             '<< Retour au menu principal'
         )
         $choice = Show-ArrowMenu -Title "Action :" -Items $actionItems -DefaultIndex 0
@@ -2953,7 +3280,7 @@ function Show-ShareOptionsMenu {
         Write-Host ""
 
         $toggleLabel = if ($current -eq 1) { 'Désactiver EnableLinkedConnections' } else { 'Activer EnableLinkedConnections' }
-        $items = @($toggleLabel, '<< Retour au menu principal')
+        $items = @($toggleLabel, '', '<< Retour au menu principal')
         $choice = Show-ArrowMenu -Title "Action :" -Items $items -DefaultIndex 0
         if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
 
@@ -3171,13 +3498,14 @@ function Invoke-WakeOnLan {
 
         $items = @($wolHosts | ForEach-Object { "{0,-25} {1}" -f $_.Name, $_.Mac })
         $items += "Nouvelle adresse MAC..."
-        if ($wolHosts.Count -gt 0) { $items += "Supprimer un hôte enregistré" }
-        $items += "<< Retour au menu principal"
+        $deleteIndex = -1
+        if ($wolHosts.Count -gt 0) { $deleteIndex = $items.Count; $items += "Supprimer un hôte enregistré" }
+        $items += '', "<< Retour au menu principal"
 
         $choice = Show-ArrowMenu -Title "Sélectionnez un hôte ou une action :" -Items $items -DefaultIndex 0
         if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
 
-        if ($wolHosts.Count -gt 0 -and $choice -eq $items.Count - 2) {
+        if ($deleteIndex -ge 0 -and $choice -eq $deleteIndex) {
             $delItems = @($wolHosts | ForEach-Object { "{0,-25} {1}" -f $_.Name, $_.Mac }) + '<< Annuler'
             $delChoice = Show-ArrowMenu -Title "Hôte à supprimer :" -Items $delItems -DefaultIndex 0
             if ($delChoice -ge 0 -and $delChoice -lt $wolHosts.Count) {
@@ -3332,7 +3660,7 @@ function Invoke-ApplyPresetToInterface {
     Clear-Host
     Write-Host "=== Appliquer le preset '$($Preset.Name)' à une interface ===" -ForegroundColor Cyan
     $items = @($interfaces | ForEach-Object { Format-InterfaceLine -Iface $_ })
-    $items += "<< Retour"
+    $items += '', "<< Retour"
     $choice = Show-ArrowMenu -Title "Sélectionnez une interface :" -Items $items -DefaultIndex 0
     if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
 
@@ -3371,9 +3699,9 @@ function Show-PresetDetailMenu {
             Write-Host "  Preset système (DHCP automatique) : non renommable, non supprimable." -ForegroundColor Yellow
             Write-Host ""
 
-            $actionItems = @('Appliquer à une interface', 'Voir le détail', '<< Retour')
+            $actionItems = @('Appliquer à une interface', 'Voir le détail', '', '<< Retour')
             $actionChoice = Show-ArrowMenu -Title "Action :" -Items $actionItems -DefaultIndex 0
-            if ($actionChoice -lt 0 -or $actionChoice -eq 2) { return }
+            if ($actionChoice -lt 0 -or $actionChoice -eq $actionItems.Count - 1) { return }
 
             if ($actionChoice -eq 0) {
                 Invoke-ApplyPresetToInterface -Preset $Preset
@@ -3392,9 +3720,9 @@ function Show-PresetDetailMenu {
         Write-Host "=== Preset : $($Preset.Name) ===" -ForegroundColor Cyan
         Write-Host ""
 
-        $actionItems = @('Appliquer à une interface', 'Voir le détail', 'Modifier le preset', 'Renommer', 'Supprimer', '<< Retour')
+        $actionItems = @('Appliquer à une interface', 'Voir le détail', 'Modifier le preset', 'Renommer', 'Supprimer', '', '<< Retour')
         $actionChoice = Show-ArrowMenu -Title "Action :" -Items $actionItems -DefaultIndex 0
-        if ($actionChoice -lt 0 -or $actionChoice -eq 5) { return }
+        if ($actionChoice -lt 0 -or $actionChoice -eq $actionItems.Count - 1) { return }
 
         if ($actionChoice -eq 0) {
             Invoke-ApplyPresetToInterface -Preset $Preset
@@ -3531,21 +3859,24 @@ function Show-PresetsMenu {
         Write-Host ""
 
         $items = @($presets | ForEach-Object { Format-PresetLine -Preset $_ })
+        $separatorIndex = $items.Count
         $items += "──────────────────────────────────────────"
+        $exportIndex = $items.Count
         $items += "Exporter tous les presets (.zip)"
+        $importIndex = $items.Count
         $items += "Importer des presets (.zip)"
-        $items += "<< Retour au menu principal"
+        $items += '', "<< Retour au menu principal"
 
         $choice = Show-ArrowMenu -Title "Sélectionnez un preset ou une action :" -Items $items -DefaultIndex 0
         if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
-        if ($choice -eq $items.Count - 4) { continue }
+        if ($choice -eq $separatorIndex) { continue }
 
-        if ($choice -eq $items.Count - 2) {
+        if ($choice -eq $importIndex) {
             Invoke-PresetsImport
             if ($script:ReturnToMainMenu) { return }
             continue
         }
-        if ($choice -eq $items.Count - 3) {
+        if ($choice -eq $exportIndex) {
             Invoke-PresetsExport -Presets $presets
             if ($script:ReturnToMainMenu) { return }
             continue
@@ -3567,6 +3898,18 @@ function Start-MainLoop {
     Write-Host "  Appuyez sur Entrée pour continuer" -ForegroundColor DarkGray
     Import-Module -Name NetAdapter, NetTCPIP, DnsClient -ErrorAction SilentlyContinue
     while ([Console]::ReadKey($true).Key -ne 'Enter') { }
+
+    # Question posee une seule fois (voir Invoke-FirstLaunchUpdatePrompt), puis verification
+    # silencieuse : n'affiche rien si tout est a jour ou si GitHub est injoignable (pas de
+    # connexion) ; installe directement sans demander confirmation si une mise a jour est
+    # trouvee, avec notification a l'ecran (voir Invoke-CheckForUpdate -Silent).
+    $appConfig = Get-AppConfig
+    if (-not $appConfig.AutoUpdatePromptAnswered) {
+        Invoke-FirstLaunchUpdatePrompt
+    }
+    if (Get-AutoUpdateEnabled) {
+        Invoke-CheckForUpdate -Silent
+    }
 
     # Chaque entree est soit un separateur visuel (Header/Blank, jamais d'Action -> no-op
     # si selectionnee), soit un item actionnable identifie par son nom (evite une dependance
@@ -3620,6 +3963,7 @@ function Start-MainLoop {
         SubOptions = @{ Title = 'Options'; Entries = @(
             [PSCustomObject]@{ Label = 'Masquer/afficher des interfaces'; Action = 'Options' }
             [PSCustomObject]@{ Label = 'Partages réseau (EnableLinkedConnections)'; Action = 'ShareOptions' }
+            [PSCustomObject]@{ Label = 'Mises à jour'; Action = 'UpdateMenu' }
             [PSCustomObject]@{ Label = 'Afficher les raccourcis clavier'; Action = 'Shortcuts' }
         ) }
     }
@@ -3630,6 +3974,17 @@ function Start-MainLoop {
         if ($menuEntries[$i].Type -eq 'Item') { $lastIndex = $i; break }
     }
 
+    # Raccourcis mnemotechniques fixes pour ces deux entrees (au lieu du prochain caractere
+    # disponible dans l'ordre 1-9/a-z), sur demande explicite : 'o'ptions, 'q'uitter.
+    $mainMenuShortcutOverrides = @{}
+    for ($i = 0; $i -lt $menuEntries.Count; $i++) {
+        # Les entrees Header/Blank n'ont pas de propriete Action (non definie dans leur
+        # PSCustomObject) : sous Set-StrictMode, la lire directement leverait une erreur.
+        if ($menuEntries[$i].Type -ne 'Item') { continue }
+        if ($menuEntries[$i].Action -eq 'SubOptions') { $mainMenuShortcutOverrides[$i] = 'o' }
+        if ($menuEntries[$i].Action -eq 'Quit') { $mainMenuShortcutOverrides[$i] = 'q' }
+    }
+
     while ($true) {
         # Remis a plat a chaque retour au menu principal : qu'il ait servi a faire remonter
         # un Echap depuis un sous-menu ou non, on est desormais "a la maison" et il ne doit
@@ -3638,7 +3993,7 @@ function Start-MainLoop {
 
         Clear-Host
         Write-Host "=== Menu principal ===" -ForegroundColor Cyan
-        $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex
+        $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex -ShortcutOverrides $mainMenuShortcutOverrides
 
         # -2 : un raccourci global vient de s'executer (voir Show-ArrowMenu) - on est deja de
         # retour au menu principal, pas de prompt de sortie a proposer. -1 = vrai Echap.
@@ -3730,6 +4085,7 @@ function Invoke-ToolAction {
         'PublicIp'        { Invoke-PublicIpLookup }
         'Options'         { Show-OptionsMenu }
         'ShareOptions'    { Show-ShareOptionsMenu }
+        'UpdateMenu'      { Show-UpdateOptionsMenu }
         'Shortcuts'       { Show-KeyboardShortcutsHelp }
     }
 }
@@ -3742,7 +4098,7 @@ function Show-ToolsSubmenu {
     while ($true) {
         Clear-Host
         Write-Host "=== $Title ===" -ForegroundColor Cyan
-        $items = @($Entries | ForEach-Object { $_.Label }) + '<< Retour au menu principal'
+        $items = @($Entries | ForEach-Object { $_.Label }) + '', '<< Retour au menu principal'
         $choice = Show-ArrowMenu -Items $items -DefaultIndex $lastIndex
         if ($choice -lt 0 -or $choice -eq $items.Count - 1) { return }
         $lastIndex = $choice
